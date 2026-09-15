@@ -35,9 +35,19 @@ pub(crate) struct Peer {
     pub(crate) guid: Vec<u8>,
     pub(crate) uuid: Bytes,
     pub(crate) pk: Bytes,
-    // pub(crate) user: Option<Vec<u8>>,
+    /// Owner of the device, as `apps/api` names it. **T3.5.3's durable cache**,
+    /// in the column upstream declares and never writes (`database.rs:96`).
+    pub(crate) user: Option<Vec<u8>>,
     pub(crate) info: PeerInfo,
-    // pub(crate) disabled: bool,
+    /// The enrolment verdict — `enrolment::STATUS_ENROLLED` / `_REFUSED`, and
+    /// `None` for every row written before T3.5.3 existed, which reads as
+    /// "nothing is known" rather than as a refusal.
+    pub(crate) status: Option<i64>,
+    /// When that verdict was last confirmed *by this process*. Deliberately not
+    /// persisted: a verdict loaded from the database is used immediately and
+    /// re-checked once, so a restart is warm without leaving a window in which
+    /// the fleet is registering unchecked.
+    pub(crate) enrol_checked: Instant,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
 }
 
@@ -50,8 +60,9 @@ impl Default for Peer {
             uuid: Bytes::new(),
             pk: Bytes::new(),
             info: Default::default(),
-            // user: None,
-            // disabled: false,
+            user: None,
+            status: None,
+            enrol_checked: get_expired_time(),
             reg_pk: (0, get_expired_time()),
         }
     }
@@ -142,9 +153,13 @@ impl PeerMap {
                 guid: v.guid,
                 uuid: v.uuid.into(),
                 pk: v.pk.into(),
-                // user: v.user,
+                // Carried through so an hbbs restart starts warm — T3.5.3.
+                // `enrol_checked` deliberately keeps its expired default, so the
+                // first registration after a restart both trusts this and
+                // re-checks it.
+                user: v.user,
+                status: v.status,
                 info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
-                // disabled: v.status == Some(0),
                 ..Default::default()
             };
             let peer = Arc::new(RwLock::new(peer));

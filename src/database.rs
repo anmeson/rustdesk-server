@@ -123,6 +123,35 @@ impl Database {
         Ok(guid)
     }
 
+    /// Caches an enrolment verdict on the peer row — TASK.md T3.5.3.
+    ///
+    /// **Keyed on `id`, not `guid`.** A device registering for the first time is
+    /// inserted by `update_pk` in the same `RegisterPk` arm that asked about it,
+    /// and the answer can arrive before that insert lands. Zero rows updated is
+    /// therefore normal, not an error: the in-memory verdict is already correct
+    /// and the next refresh persists it.
+    ///
+    /// `user` and `status` are columns upstream declares, selects and indexes
+    /// but never writes — so this adds no schema change, and `sqlx`'s
+    /// compile-time checks pass against the committed `db_v2.sqlite3`.
+    pub async fn set_peer_enrolment(
+        &self,
+        id: &str,
+        user: Option<&[u8]>,
+        status: i64,
+    ) -> ResultType<u64> {
+        let rows = sqlx::query!(
+            "update peer set user=?, status=? where id=?",
+            user,
+            status,
+            id
+        )
+        .execute(self.pool.get().await?.deref_mut())
+        .await?
+        .rows_affected();
+        Ok(rows)
+    }
+
     pub async fn update_pk(
         &self,
         guid: &Vec<u8>,

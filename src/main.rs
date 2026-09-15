@@ -37,7 +37,10 @@ fn main() -> ResultType<()> {
         , --breakglass-rate-per-minute=[NUMBER(default=10)] 'Break-glass verification attempts allowed per source IP per minute'
         , --breakglass-audit-log=[FILE] 'Local append-only record of every break-glass use, written and fsynced before the connection is allowed'
         , --breakglass-audit-required=[Y/N(default=Y)] 'Refuse a break-glass use that cannot be written to that file'
-        , --breakglass-reconcile-sec=[NUMBER(default=60)] 'How often to replay unacknowledged break-glass records to the auth API'",
+        , --breakglass-reconcile-sec=[NUMBER(default=60)] 'How often to replay unacknowledged break-glass records to the auth API'
+        , --enrol-required=[Y/N(default=N)] 'Require a device to be enrolled (rustdesk --deploy) before it may register an id'
+        , --enrol-cache-ttl-ms=[NUMBER(default=600000)] 'How long an enrolment verdict is used before it is re-checked'
+        , --enrol-rate-per-minute=[NUMBER(default=120)] 'Enrolment checks sent to the auth API per minute, across all devices'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
     // Read and validated before anything binds a port. A misconfiguration here
@@ -51,6 +54,10 @@ fn main() -> ResultType<()> {
     // the one line it logs is the only place the resolved value is visible.
     let broker_config = broker::BrokerConfig::from_args()?;
     broker_config.log();
+    // T3.5.2. Reads the same api url and secret as `auth_config`, so it is
+    // validated against it — and, like the two above, before any port binds.
+    let enrolment_config = enrolment::EnrolmentConfig::from_args(&auth_config)?;
+    enrolment_config.log();
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
     if port < 3 {
         bail!("Invalid port");
@@ -67,6 +74,7 @@ fn main() -> ResultType<()> {
         rmem,
         auth_config,
         broker_config,
+        enrolment_config,
     )?;
     Ok(())
 }

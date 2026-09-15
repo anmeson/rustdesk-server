@@ -456,6 +456,44 @@ pub async fn register(port: u16, id: &str) -> FramedSocket {
     panic!("hbbs never answered RegisterPk for {id}");
 }
 
+/// Sends one `RegisterPk` and returns what hbbs answered, or `None` if it said
+/// nothing within `ms`.
+///
+/// Unlike `register`, this neither retries nor asserts on the result — T3.5.2's
+/// whole subject is the answer itself, and `NOT_DEPLOYED` is a legitimate one.
+/// The socket is handed back so a test can send a second registration on the
+/// same one and watch a verdict change.
+pub async fn register_pk_on(
+    sock: &mut FramedSocket,
+    port: u16,
+    id: &str,
+    uuid: &[u8],
+    pk: &[u8],
+    ms: u64,
+) -> Option<register_pk_response::Result> {
+    let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut msg = RendezvousMessage::new();
+    msg.set_register_pk(RegisterPk {
+        id: id.to_owned(),
+        uuid: uuid.to_vec().into(),
+        pk: pk.to_vec().into(),
+        ..Default::default()
+    });
+    sock.send(&msg, server).await.unwrap();
+    let (bytes, _) = sock.next_timeout(ms).await?.ok()?;
+    match RendezvousMessage::parse_from_bytes(&bytes).unwrap().union {
+        Some(rendezvous_message::Union::RegisterPkResponse(r)) => Some(r.result.enum_value().unwrap()),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// A fresh UDP socket to speak `RegisterPk` from.
+pub async fn udp_socket() -> FramedSocket {
+    FramedSocket::new("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .unwrap()
+}
+
 /// Sends one `PunchHoleRequest` and waits `ms` for a `PunchHoleResponse`.
 ///
 /// `None` is the *allow* outcome: on an allow hbbs answers nobody and forwards
@@ -591,6 +629,28 @@ pub fn auth_args(stub: &Stub) -> Vec<String> {
         "--auth-timeout-ms".into(),
         "4000".into(),
     ]
+}
+
+/// Turns registration ownership on (T3.5.2). Separate from `auth_args` because
+/// the feature is: `AUTH_API_URL` alone must *not* enable it.
+pub fn enrol_args() -> Vec<String> {
+    vec!["--enrol-required".into(), "Y".into()]
+}
+
+/// An answer to `POST /api/internal/enrolled`. The stub answers on content, so a
+/// test can hand back different verdicts for different device ids.
+pub fn enrolled(yes: bool) -> String {
+    if yes {
+        r#"{"enrolled":true,"user_id":"user-t352"}"#.to_owned()
+    } else {
+        r#"{"enrolled":false,"reason":"no such device"}"#.to_owned()
+    }
+}
+
+/// True when this captured request is the enrolment call rather than the
+/// authorize one.
+pub fn is_enrolment(request: &str) -> bool {
+    request.contains("/api/internal/enrolled")
 }
 
 pub const ALLOW: &str = r#"{"allow":true,"conn_audit_ref":"ref-t33","permissions":6}"#;

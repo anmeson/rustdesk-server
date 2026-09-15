@@ -1,5 +1,9 @@
 use crate::auth::{self, AuthRequest, Authorizer};
 use crate::broker::{BrokerLedger, Verdict};
+// `Verdict` aliased: `broker::Verdict` is already in scope above and the two
+// answer different questions — who may answer a brokered connection, and
+// whether a device may register at all.
+use crate::enrolment::{self, Enrolment, EnrolmentConfig, Verdict as EnrolVerdict};
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
@@ -15,7 +19,7 @@ use hbb_common::{
     log,
     protobuf::{Message as _, MessageField},
     rendezvous_proto::{
-        register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
+        register_pk_response::Result::{NOT_DEPLOYED, TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
     tcp::{Encrypt, FramedStream},
@@ -126,6 +130,10 @@ pub struct RendezvousServer {
     /// answering the response has never heard of, which is "nobody can connect"
     /// with extra steps.
     broker: Arc<BrokerLedger>,
+    /// Whether a device may claim an id at all (T3.5.2). Shared, not cloned, for
+    /// the third time in this struct and the third reason: it holds the outbound
+    /// rate limit, and a per-clone budget would not be a budget.
+    enrolment: Arc<Enrolment>,
 }
 
 enum LoopFailure {
@@ -144,8 +152,18 @@ impl RendezvousServer {
         rmem: usize,
         auth_config: auth::AuthConfig,
         broker_config: crate::broker::BrokerConfig,
+        enrolment_config: EnrolmentConfig,
     ) -> ResultType<()> {
-        Self::start_with_bind(None, port, serial, key, rmem, auth_config, broker_config)
+        Self::start_with_bind(
+            None,
+            port,
+            serial,
+            key,
+            rmem,
+            auth_config,
+            broker_config,
+            enrolment_config,
+        )
     }
 
     #[tokio::main(flavor = "multi_thread")]
@@ -157,10 +175,15 @@ impl RendezvousServer {
         rmem: usize,
         auth_config: auth::AuthConfig,
         broker_config: crate::broker::BrokerConfig,
+        enrolment_config: EnrolmentConfig,
     ) -> ResultType<()> {
         // Inside the tokio runtime (`#[tokio::main]` above) and before any port
         // is bound, which is what `Authorizer::new` asks for: it builds the
         // reqwest client the whole process then shares.
+        // Built before the authorizer consumes the config: enrolment asks the
+        // same api server, with the same secret and the same timeout, on a
+        // different path — there is deliberately no second endpoint to configure.
+        let enrolment = Arc::new(Enrolment::new(enrolment_config, auth_config.clone())?);
         let authorizer = Arc::new(Authorizer::new(auth_config)?);
         let broker = Arc::new(BrokerLedger::new(broker_config));
         // T3.6. Its own task, not part of any request path: the audit records
@@ -202,6 +225,7 @@ impl RendezvousServer {
             rendezvous_servers: Arc::new(rendezvous_servers),
             authorizer,
             broker,
+            enrolment,
             inner: Arc::new(Inner {
                 serial,
                 version,
@@ -484,6 +508,79 @@ impl RendezvousServer {
                     req_pk.0 += 1;
                     req_pk.1 = Instant::now();
                     peer.write().await.reg_pk = req_pk;
+
+                    // --- Registration ownership, TASK.md T3.5.2 -------------
+                    // Last of the checks, so nothing that was going to be
+                    // refused anyway reaches it, and **before** `update_pk`, so
+                    // a stranger's id never lands in the peer table.
+                    //
+                    // Reads memory only. This arm is awaited inline in
+                    // `io_loop` (`:339`), unlike the TCP path which spawns per
+                    // connection — an api call here would put every datagram
+                    // the server handles, for the whole fleet, behind one round
+                    // trip. `enrolment::refresh` does the asking off the loop
+                    // and writes the answer where the next `RegisterPk` (15 s
+                    // later, `REG_INTERVAL`) will read it.
+                    if self.enrolment.enabled() {
+                        let (status, checked_at, known) = {
+                            let p = peer.read().await;
+                            // `pk` empty means hbbs has no registration for this
+                            // id yet — `get_or` above may have just put an empty
+                            // peer in the map, and that is not a registration.
+                            (p.status, p.enrol_checked, !p.pk.is_empty())
+                        };
+                        let verdict = self.enrolment.verdict(status);
+                        if verdict == EnrolVerdict::Unknown
+                            || self.enrolment.stale(checked_at)
+                        {
+                            enrolment::refresh(
+                                self.enrolment.clone(),
+                                self.pm.db.clone(),
+                                peer.clone(),
+                                id.clone(),
+                                rk.uuid.clone(),
+                                rk.pk.clone(),
+                            );
+                        }
+                        if verdict == EnrolVerdict::Refused {
+                            log::info!(
+                                "enrol gate=register outcome=not-deployed id={:?} ip={:?}",
+                                id,
+                                ip
+                            );
+                            return send_rk_res(socket, addr, NOT_DEPLOYED).await;
+                        }
+                        // **First contact, and we do not yet know whose device
+                        // this is.** Answering `OK` here without writing the row
+                        // is the difference between an unenrolled device being
+                        // briefly unreachable and it *taking the id*: `update_pk`
+                        // is what claims one, and a claim by a stranger is what
+                        // this task exists to stop.
+                        //
+                        // Registration is not refused — that is T3.5.3's rule and
+                        // it still holds — it is deferred, by exactly one round
+                        // trip, using upstream's own mechanism: a peer with no
+                        // `pk` is answered `request_pk: true` on its next
+                        // heartbeat (`update_addr`, `:834`), so the client sends
+                        // `RegisterPk` again and by then the verdict has landed.
+                        if verdict == EnrolVerdict::Unknown && !known {
+                            log::info!(
+                                "enrol gate=register outcome=deferred id={:?} ip={:?}",
+                                id,
+                                ip
+                            );
+                            return send_rk_res(
+                                socket,
+                                addr,
+                                register_pk_response::Result::OK,
+                            )
+                            .await;
+                        }
+                        // Anything else — enrolled, or unknown but already
+                        // registered — takes upstream's path unchanged.
+                    }
+                    // --------------------------------------------------------
+
                     if ip_changed {
                         let mut lock = IP_CHANGES.lock().await;
                         if let Some((tm, ips)) = lock.get_mut(&id) {

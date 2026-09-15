@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod breakglass;
 pub mod broker;
+pub mod enrolment;
 mod rendezvous_server;
 pub use rendezvous_server::*;
 pub mod common;
