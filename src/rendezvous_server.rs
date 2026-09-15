@@ -536,18 +536,12 @@ impl RendezvousServer {
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
                     return true;
                 }
-                Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                Some(rendezvous_message::Union::RequestRelay(rf)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
-                        let mut msg_out = RendezvousMessage::new();
-                        rf.socket_addr = AddrMangle::encode(addr).into();
-                        msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
-                    }
+                    self.handle_request_relay(addr, rf).await;
                     return true;
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
@@ -558,6 +552,18 @@ impl RendezvousServer {
                         let pk = self.get_pk(&rr.version, id.to_owned()).await;
                         rr.set_pk(pk);
                     }
+                    // Dropped, never forwarded (T3.3b). `RelayResponse` is routed
+                    // purely on an address the *sender* supplies, and this is the
+                    // only attacker-reachable field that becomes text on the
+                    // waiting user's screen — the client `bail!`s with it
+                    // verbatim (`apps/rustdesk/src/client.rs:1755-1757`). Nothing
+                    // legitimate sets it: the client only ever reads it, and OSS
+                    // hbbs never wrote it either, so forwarding it can only carry
+                    // a stranger's words. Demonstrated against the running
+                    // binaries before this line existed. Our own refusals do not
+                    // come through here — they are built and sent to A directly
+                    // by `handle_request_relay`.
+                    rr.refuse_reason = Default::default();
                     let mut msg_out = RendezvousMessage::new();
                     if !rr.relay_server.is_empty() {
                         if self.is_lan(addr_b) {
@@ -968,6 +974,100 @@ impl RendezvousServer {
         let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         Self::send_to_sink(&mut sink, msg).await;
         Ok(())
+    }
+
+    /// The relay fallback — and the *second* way into a controlled device.
+    ///
+    /// Upstream forwards this message to the named peer having checked nothing:
+    /// not the licence key, not the token, and never reaching
+    /// `handle_punch_hole_request`. The peer answers it with `create_relay`
+    /// (`apps/rustdesk/src/rendezvous_mediator.rs:579-604`) and a real session
+    /// opens. Verified against the running binaries in T3.3: a `RequestRelay`
+    /// with no token and a deliberately wrong key reached a registered peer. So
+    /// authorizing only the punch path leaves the punch path decorative — this
+    /// is T3.3b.
+    ///
+    /// Normally this arrives *after* a `PunchHoleRequest` we already approved,
+    /// and the decision cache is what keeps that one connection to one decision.
+    /// Nothing requires that order, though, so it is authorized in its own right.
+    ///
+    /// Unlike the punch path, a refusal has somewhere to go: A is waiting on this
+    /// very socket for a `RelayResponse`, and the client `bail!`s with
+    /// `refuse_reason` verbatim (`apps/rustdesk/src/client.rs:1755-1757`).
+    #[inline]
+    async fn handle_request_relay(&mut self, addr: SocketAddr, mut rf: RequestRelay) {
+        // Upstream's check, kept first: it is free, and it decides nothing a
+        // stranger learns — an unknown peer is answered with silence either way.
+        let Some(peer) = self.pm.get_in_memory(&rf.id).await else {
+            return;
+        };
+
+        if self.authorizer.enabled() {
+            let decision = self
+                .authorizer
+                .authorize(&AuthRequest {
+                    token: &rf.token,
+                    // `RequestRelay` names the peer, never the caller.
+                    from_id: "",
+                    to_id: &rf.id,
+                    conn_type: auth::conn_type_name(rf.conn_type),
+                    from_ip: &try_into_v4(addr).ip().to_string(),
+                })
+                .await;
+            if !decision.allow {
+                log::info!(
+                    "Relay denied for peer {} from {} [{}]: {}",
+                    rf.id,
+                    addr,
+                    decision.source.label(),
+                    decision.reason
+                );
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_relay_response(RelayResponse {
+                    refuse_reason: decision.reason,
+                    ..Default::default()
+                });
+                allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                return;
+            }
+            if decision.breakglass {
+                log::warn!(
+                    "Break-glass capability authorized relay {} -> {} [{}]",
+                    addr,
+                    rf.id,
+                    decision.source.label()
+                );
+            }
+            // **Overwritten, never merged.** Unlike the punch path — where hbbs
+            // builds the outbound message itself — this one is A's message being
+            // forwarded, so both fields arrive from A and upstream passes them
+            // through untouched. A forged `conn_audit_ref` would let one session
+            // complete another user's decision row: it would be logged as that
+            // user, and the real session would find nothing left to join and be
+            // recorded unattributed, which is to say unrevocable. So they are
+            // replaced by what the api decided, including with nothing.
+            rf.controlled_context = if decision.conn_audit_ref.is_empty() {
+                MessageField::none()
+            } else {
+                MessageField::some(ControlledContext {
+                    conn_audit_ref: decision.conn_audit_ref,
+                    ..Default::default()
+                })
+            };
+            rf.control_permissions = match decision.permissions {
+                Some(permissions) => MessageField::some(ControlPermissions {
+                    permissions: permissions as u64,
+                    ..Default::default()
+                }),
+                None => MessageField::none(),
+            };
+        }
+
+        let mut msg_out = RendezvousMessage::new();
+        rf.socket_addr = AddrMangle::encode(addr).into();
+        msg_out.set_request_relay(rf);
+        let peer_addr = peer.read().await.socket_addr;
+        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
     }
 
     #[inline]

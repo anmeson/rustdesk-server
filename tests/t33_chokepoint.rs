@@ -5,7 +5,7 @@
 //! checks both what A gets back and what B is handed.
 
 use hbb_common::{
-    protobuf::Message as _,
+    protobuf::{Message as _, MessageField},
     rendezvous_proto::*,
     tcp::FramedStream,
     tokio::{
@@ -15,6 +15,7 @@ use hbb_common::{
         time::sleep,
     },
     udp::FramedSocket,
+    AddrMangle,
 };
 use std::{
     net::SocketAddr,
@@ -359,6 +360,65 @@ const REFUSAL_WAIT: u64 = 4_000;
 /// waited out on the happy path of several tests.
 const ALLOW_WAIT: u64 = 800;
 
+/// Sends one `RequestRelay` as A and waits `ms` for a `RelayResponse`.
+///
+/// `None` means hbbs forwarded it and said nothing to A, which is the allow
+/// outcome. A refusal comes back here as `refuse_reason`, which the client
+/// `bail!`s with verbatim.
+async fn request_relay(
+    port: u16,
+    id: &str,
+    token: &str,
+    forged_ref: Option<&str>,
+    ms: u64,
+) -> Option<RelayResponse> {
+    let mut stream = FramedStream::new(format!("127.0.0.1:{port}"), None, 3_000)
+        .await
+        .unwrap();
+    let mut rr = RequestRelay {
+        id: id.to_owned(),
+        uuid: "t33-relay-uuid".to_owned(),
+        token: token.to_owned(),
+        // Deliberately not the server's key: upstream never checks it here, and
+        // neither do we — the token is the stronger claim and the only one we
+        // are prepared to defend.
+        licence_key: "not-the-key".to_owned(),
+        relay_server: "127.0.0.1:21117".to_owned(),
+        ..Default::default()
+    };
+    if let Some(forged) = forged_ref {
+        rr.controlled_context = MessageField::some(ControlledContext {
+            conn_audit_ref: forged.to_owned(),
+            ..Default::default()
+        });
+        rr.control_permissions = MessageField::some(ControlPermissions {
+            permissions: 0b10_10_10,
+            ..Default::default()
+        });
+    }
+    let mut msg = RendezvousMessage::new();
+    msg.set_request_relay(rr);
+    stream.send(&msg).await.unwrap();
+    let bytes = stream.next_timeout(ms).await?.unwrap();
+    match RendezvousMessage::parse_from_bytes(&bytes).unwrap().union {
+        Some(rendezvous_message::Union::RelayResponse(rs)) => Some(rs),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// The `RequestRelay` hbbs forwarded to B, with the two fields that matter.
+async fn relay_at_b(sock: &mut FramedSocket) -> RequestRelay {
+    let (bytes, _) = sock
+        .next_timeout(4_000)
+        .await
+        .expect("hbbs forwarded B nothing")
+        .unwrap();
+    match RendezvousMessage::parse_from_bytes(&bytes).unwrap().union {
+        Some(rendezvous_message::Union::RequestRelay(rr)) => rr,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 async fn next_from_hbbs(sock: &mut FramedSocket) -> RendezvousMessage {
     let (bytes, _) = sock.next_timeout(4_000).await.expect("hbbs sent B nothing").unwrap();
     RendezvousMessage::parse_from_bytes(&bytes).unwrap()
@@ -542,48 +602,282 @@ async fn a_retry_of_one_connect_spends_one_decision_but_a_file_transfer_does_not
     assert_eq!(ctx.unwrap().conn_audit_ref, "ref-t33-files");
 }
 
-/// **This test asserts a hole, not a fix — see T3.3b.**
-///
-/// `RequestRelay` is a second, independent way into a controlled device, and
-/// `handle_tcp` forwards it with no licence-key check and no authorization at
-/// all (`rendezvous_server.rs:522-532`). The controlled device answers it with
-/// `create_relay` (`apps/rustdesk/src/rendezvous_mediator.rs:579-604`), so a
-/// stranger who never sent a `PunchHoleRequest` still reaches it — our login
-/// layer skipped entirely, with only stock RustDesk's own password left.
-///
-/// It is pinned here so that closing it in T3.3b shows up as this test failing,
-/// rather than as nobody noticing either way.
+// ------------------------------------------------- the relay path (T3.3b)
+//
+// `RequestRelay` is the second way into a controlled device. Until T3.3b it was
+// forwarded to the peer with nothing checked at all, which made the punch-hole
+// gate above decorative: a stranger could simply not send a `PunchHoleRequest`.
+
 #[tokio::test(flavor = "multi_thread")]
-async fn request_relay_still_bypasses_the_chokepoint() {
-    let api = stub(200, DENY).await;
+async fn a_relay_request_without_a_token_is_refused_in_words() {
+    let api = stub(200, ALLOW).await;
     let s = hbbs(&auth_args(&api)).await;
     let mut b = register(s.port, "t33-dev-8").await;
 
-    // No PunchHoleRequest, no token, and a licence key that is not the server's.
-    let mut stream = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+    let rs = request_relay(s.port, "t33-dev-8", "", None, REFUSAL_WAIT)
+        .await
+        .expect("no refusal came back");
+    assert!(!rs.refuse_reason.is_empty(), "the relay path let an empty token through");
+    assert!(b.next_timeout(700).await.is_none(), "B was contacted anyway");
+    assert_eq!(api.calls(), 0, "spent an api call on an empty token");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_request_from_an_ungranted_user_is_refused_in_words() {
+    let api = stub(200, DENY).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-9").await;
+
+    let rs = request_relay(s.port, "t33-dev-9", "bad-token", None, REFUSAL_WAIT)
+        .await
+        .expect("no refusal came back");
+    assert_eq!(rs.refuse_reason, "You do not have access to this device.");
+    assert!(b.next_timeout(700).await.is_none(), "B was contacted anyway");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_api_fails_closed_on_the_relay_path_too() {
+    let api = stub(200, ALLOW).await;
+    let mut args = auth_args(&api);
+    args[1] = format!("http://127.0.0.1:{}", dead_port());
+    let s = hbbs(&args).await;
+    let mut b = register(s.port, "t33-dev-10").await;
+
+    let rs = request_relay(s.port, "t33-dev-10", "good-token", None, REFUSAL_WAIT)
+        .await
+        .expect("no refusal came back");
+    assert!(rs.refuse_reason.to_lowercase().contains("unavailable"), "{}", rs.refuse_reason);
+    assert!(b.next_timeout(700).await.is_none(), "B was contacted anyway");
+}
+
+/// A relayed session is attributable only if the ref reaches B *on this
+/// message*: each hbbs message carries its own metadata, so the ref sent with
+/// the earlier `PunchHole` does not survive into the relay fallback. Before
+/// T3.3b every relayed session was therefore unattributed — and an unattributed
+/// session is one D2 revocation cannot find.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_granted_relay_request_carries_the_audit_ref_to_the_device() {
+    let api = stub(200, r#"{"allow":true,"conn_audit_ref":"ref-relay","permissions":6}"#).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-11").await;
+
+    let refusal = request_relay(s.port, "t33-dev-11", "good-token", None, ALLOW_WAIT).await;
+    assert!(refusal.is_none(), "denied: {refusal:?}");
+
+    let rr = relay_at_b(&mut b).await;
+    assert_eq!(rr.uuid, "t33-relay-uuid");
+    assert_eq!(
+        rr.controlled_context.into_option().expect("no controlled_context").conn_audit_ref,
+        "ref-relay"
+    );
+    assert_eq!(
+        rr.control_permissions.into_option().expect("no control_permissions").permissions,
+        6
+    );
+}
+
+/// The two metadata fields arrive from A on this path, and upstream forwards
+/// them untouched. A ref A chose would let A's session complete somebody else's
+/// decision row — logged as that user, and leaving the real session with nothing
+/// to join and so unrevocable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_audit_ref_on_a_relay_request_is_overwritten() {
+    let api = stub(200, r#"{"allow":true,"conn_audit_ref":"ref-real"}"#).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-12").await;
+
+    let refusal = request_relay(
+        s.port,
+        "t33-dev-12",
+        "good-token",
+        Some("ref-somebody-elses"),
+        ALLOW_WAIT,
+    )
+    .await;
+    assert!(refusal.is_none(), "denied: {refusal:?}");
+
+    let rr = relay_at_b(&mut b).await;
+    assert_eq!(
+        rr.controlled_context.into_option().expect("no controlled_context").conn_audit_ref,
+        "ref-real"
+    );
+    // The api set no permission limit, so the field A supplied must be gone
+    // rather than left to grant A whatever it asked for.
+    assert!(
+        rr.control_permissions.is_none(),
+        "A's own control_permissions survived: {:?}",
+        rr.control_permissions
+    );
+}
+
+/// The real sequence: a punch we approved, then the relay fallback for the same
+/// connection. It must cost one decision and carry one ref — a second ref means
+/// a second `connection_logs` row for one connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_fallback_reuses_the_punch_decision() {
+    let api = stub(200, ALLOW).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-13").await;
+
+    punch(s.port, &s.key, "t33-dev-13", "good-token", ConnType::DEFAULT_CONN, ALLOW_WAIT).await;
+    next_from_hbbs(&mut b).await;
+
+    let refusal = request_relay(s.port, "t33-dev-13", "good-token", None, ALLOW_WAIT).await;
+    assert!(refusal.is_none(), "denied: {refusal:?}");
+    let rr = relay_at_b(&mut b).await;
+
+    assert_eq!(api.calls(), 1, "the relay fallback minted a second decision");
+    assert_eq!(
+        rr.controlled_context.into_option().expect("no controlled_context").conn_audit_ref,
+        "ref-t33",
+        "the relay fallback carried a different ref from the punch it followed"
+    );
+}
+
+/// With authorization off, upstream's path runs unchanged — including the two
+/// metadata fields, which are otherwise replaced.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_authorization_off_a_relay_request_is_forwarded_unchanged() {
+    let s = hbbs(&[]).await;
+    let mut b = register(s.port, "t33-dev-14").await;
+
+    let refusal = request_relay(s.port, "t33-dev-14", "", Some("whatever-a-said"), ALLOW_WAIT).await;
+    assert!(refusal.is_none(), "refused with authorization off: {refusal:?}");
+
+    let rr = relay_at_b(&mut b).await;
+    assert_eq!(
+        rr.controlled_context.into_option().expect("no controlled_context").conn_audit_ref,
+        "whatever-a-said"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_request_for_an_unknown_peer_is_silent_and_free() {
+    let api = stub(200, ALLOW).await;
+    let s = hbbs(&auth_args(&api)).await;
+
+    let rs = request_relay(s.port, "t33-nobody", "good-token", None, 1_200).await;
+    assert!(rs.is_none(), "answered for a peer that does not exist: {rs:?}");
+    assert_eq!(api.calls(), 0, "spent an api call on a peer that does not exist");
+}
+
+// ------------------------------------------- injecting into a waiting peer
+//
+// `PunchHoleSent`, `LocalAddr` and `RelayResponse` are all routed on an address
+// the *sender* supplies, and upstream checks nothing about who sent them. So a
+// stranger who knows a waiting controller's address as hbbs sees it can answer
+// on the real peer's behalf. Both tests below were written against the running
+// binaries, not from reading the source.
+
+/// A stranger's *words* must not reach a waiting user. This one is fixed
+/// (T3.3b): `refuse_reason` is the only attacker-reachable field that becomes
+/// text on screen, nothing legitimate ever sets it, so hbbs drops it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranger_cannot_put_text_on_a_waiting_users_screen() {
+    let api = stub(200, ALLOW).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-15").await;
+
+    // A asks for a relay and waits for a RelayResponse.
+    let mut a = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let a_addr = a.local_addr();
+    let mut msg = RendezvousMessage::new();
+    msg.set_request_relay(RequestRelay {
+        id: "t33-dev-15".to_owned(),
+        uuid: "t33-relay-uuid".to_owned(),
+        token: "good-token".to_owned(),
+        relay_server: "127.0.0.1:21117".to_owned(),
+        ..Default::default()
+    });
+    a.send(&msg).await.unwrap();
+    let _ = relay_at_b(&mut b).await;
+
+    // Someone entirely unrelated answers on A's behalf.
+    let mut evil = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
         .await
         .unwrap();
     let mut msg = RendezvousMessage::new();
-    msg.set_request_relay(RequestRelay {
-        id: "t33-dev-8".to_owned(),
-        uuid: "t33-relay-uuid".to_owned(),
-        licence_key: "not-the-key".to_owned(),
-        token: String::new(),
-        relay_server: format!("127.0.0.1:{}", s.port + 1),
+    msg.set_relay_response(RelayResponse {
+        socket_addr: AddrMangle::encode(a_addr).into(),
+        refuse_reason: "Your licence has expired. Call +1-555-0100 to renew.".to_owned(),
         ..Default::default()
     });
-    stream.send(&msg).await.unwrap();
+    evil.send(&msg).await.unwrap();
 
-    let (bytes, _) = b
-        .next_timeout(2_000)
+    if let Some(Ok(bytes)) = a.next_timeout(2_500).await {
+        match RendezvousMessage::parse_from_bytes(&bytes).unwrap().union {
+            Some(rendezvous_message::Union::RelayResponse(rs)) => assert!(
+                rs.refuse_reason.is_empty(),
+                "a stranger's text reached the user: {:?}",
+                rs.refuse_reason
+            ),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+/// **This test asserts a hole, not a fix — see T3.8.**
+///
+/// The message still arrives; only its text was taken away above. A stranger
+/// can still answer a waiting controller with an address and relay server of
+/// their choosing, because nothing ties a response to the peer it claims to come
+/// from. Closing that needs hbbs to remember which pairs it brokered, which is a
+/// change to upstream's core routing and wants testing against real devices on a
+/// real network — so it is filed rather than guessed at here.
+///
+/// Pinned so that closing it shows up as this test failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranger_can_still_answer_a_waiting_controller() {
+    let api = stub(200, ALLOW).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-16").await;
+
+    let mut a = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
         .await
-        .expect("T3.3b may have landed: B was not contacted, so update this test")
         .unwrap();
+    let a_addr = a.local_addr();
+    let mut msg = RendezvousMessage::new();
+    msg.set_punch_hole_request(PunchHoleRequest {
+        id: "t33-dev-16".to_owned(),
+        licence_key: s.key.clone(),
+        token: "good-token".to_owned(),
+        ..Default::default()
+    });
+    a.send(&msg).await.unwrap();
+    // B is contacted and A hears nothing yet: that is the window.
+    let _ = next_from_hbbs(&mut b).await;
+
+    let mut evil = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let mut msg = RendezvousMessage::new();
+    msg.set_punch_hole_sent(PunchHoleSent {
+        socket_addr: AddrMangle::encode(a_addr).into(),
+        // An id hbbs has never heard of, which is what makes this worse than a
+        // nuisance: `get_pk` returns nothing, and the client treats an absent
+        // peer key as "no identity to verify" and connects anyway
+        // (`apps/rustdesk/src/client.rs:1624-1634`).
+        id: "t33-not-a-device".to_owned(),
+        relay_server: "evil.example.com:21117".to_owned(),
+        version: "1.5.0".to_owned(),
+        ..Default::default()
+    });
+    evil.send(&msg).await.unwrap();
+
+    let (bytes, _) = (
+        a.next_timeout(2_500)
+            .await
+            .expect("T3.8 may have landed: update this test")
+            .unwrap(),
+        (),
+    );
     match RendezvousMessage::parse_from_bytes(&bytes).unwrap().union {
-        Some(rendezvous_message::Union::RequestRelay(rr)) => {
-            assert_eq!(rr.uuid, "t33-relay-uuid");
+        Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
+            assert_eq!(ph.relay_server, "evil.example.com:21117");
+            assert!(ph.pk.is_empty(), "hbbs supplied a key for an unknown id");
         }
         other => panic!("unexpected {other:?}"),
     }
-    assert_eq!(api.calls(), 0, "the relay path is authorized now — update this test");
 }
