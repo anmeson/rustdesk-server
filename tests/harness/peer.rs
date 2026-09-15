@@ -180,6 +180,61 @@ impl Device {
         panic!("hbbs never answered RegisterPk for {id}");
     }
 
+    /// Registers from an address that is **not** loopback — T5.10's whole
+    /// subject.
+    ///
+    /// `ALWAYS_USE_RELAY=Y` is silently ignored whenever hbbs sees the same IP
+    /// for both peers (`rendezvous_server.rs:763`, found in T0.5): the override
+    /// only rewrites `nat_type`, and `same_intranet` is computed independently
+    /// of it and selects the `FetchLocalAddr` branch, which has no `nat_type` at
+    /// all. Every peer in this harness is on 127.0.0.1, so the flag does nothing
+    /// to a punch — which is worth knowing before writing a test that assumes
+    /// otherwise.
+    ///
+    /// Reaching hbbs on the host's own LAN address gives the device a different
+    /// source IP to the controller's, which is what makes the flag bite. Use
+    /// `relay::relay_host()` for `host`.
+    pub async fn register_from(host: &str, hbbs_port: u16, id: &str, uuid: &[u8], pk: &[u8]) -> Device {
+        let mut sock = FramedSocket::new("0.0.0.0:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let server: SocketAddr = format!("{host}:{hbbs_port}")
+            .parse()
+            .unwrap_or_else(|_| panic!("{host} is not an address hbbs can be reached at"));
+        let mut msg = RendezvousMessage::new();
+        msg.set_register_pk(RegisterPk {
+            id: id.to_owned(),
+            uuid: uuid.to_vec().into(),
+            pk: pk.to_vec().into(),
+            ..Default::default()
+        });
+        for _ in 0..40 {
+            sock.send(&msg, server).await.unwrap();
+            let Some(Ok((bytes, _))) = sock.next_timeout(500).await else {
+                continue;
+            };
+            match RendezvousMessage::parse_from_bytes(&bytes).unwrap().union {
+                Some(rendezvous_message::Union::RegisterPkResponse(r)) => {
+                    assert_eq!(
+                        r.result.enum_value(),
+                        Ok(register_pk_response::Result::OK),
+                        "device {id} was refused registration from {host}: {:?}",
+                        r.result
+                    );
+                    return Device {
+                        id: id.to_owned(),
+                        uuid: uuid.to_vec(),
+                        pk: pk.to_vec(),
+                        sock,
+                        hbbs_port,
+                    };
+                }
+                other => panic!("unexpected answer to RegisterPk: {other:?}"),
+            }
+        }
+        panic!("hbbs never answered RegisterPk for {id} at {host}");
+    }
+
     /// Sends one more `RegisterPk` on the socket this device already holds, and
     /// returns hbbs's verdict without asserting on it.
     pub async fn register_again(
