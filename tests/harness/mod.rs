@@ -110,6 +110,26 @@ pub async fn stub(status: u16, body: &'static str) -> Stub {
     stub_by(move |_| (status, body.to_owned())).await
 }
 
+/// A stub that refuses everything until it is switched on.
+///
+/// Not "a stub that is started later": the port has to be bound from the
+/// beginning, because hbbs is given the address at boot and a port that is
+/// closed and then opened is a different thing to test than a server that is
+/// failing and then recovers. While it is off, every request gets a 503, which
+/// is what hbbs sees from a service that is up but unwell — the outage this
+/// path exists for.
+pub fn switchable() -> (Arc<std::sync::atomic::AtomicBool>, impl Fn(&str) -> (u16, String) + Send + Sync + 'static) {
+    let on = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = on.clone();
+    (on, move |_: &str| {
+        if flag.load(Ordering::SeqCst) {
+            (200, r#"{"ok":true,"stored":1,"already_known":0}"#.to_owned())
+        } else {
+            (503, r#"{"error":"down"}"#.to_owned())
+        }
+    })
+}
+
 // ---------------------------------------------------------------- hbbs
 
 pub struct Hbbs {
@@ -152,6 +172,13 @@ impl Drop for TempDir {
 }
 
 impl Hbbs {
+    /// The working directory hbbs was started in, which is where it writes
+    /// anything it is given a relative path for — the break-glass audit log
+    /// (T3.6) among them.
+    pub fn dir(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+
     pub fn log(&self) -> String {
         std::fs::read_to_string(self._dir.path().join("hbbs.log")).unwrap_or_default()
     }

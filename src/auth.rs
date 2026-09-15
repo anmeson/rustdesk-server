@@ -504,6 +504,25 @@ impl Authorizer {
         self.breakglass.enabled()
     }
 
+    /// The reconciler task, or `None` when there is nothing to reconcile to
+    /// (T3.6). Built here because this is where the api url, the shared secret
+    /// and the audit log are all in scope at once.
+    pub fn breakglass_reconciler(&self) -> Option<breakglass::Reconciler> {
+        breakglass::Reconciler::new(
+            self.breakglass.audit(),
+            &self.config.api_url,
+            &self.config.api_secret,
+            self.config.timeout,
+            self.breakglass.reconcile_every(),
+            self.breakglass.enabled(),
+        )
+    }
+
+    /// Records the api has not acknowledged, for T3.7's console counter.
+    pub fn breakglass_pending(&self) -> usize {
+        self.breakglass.audit().pending_count()
+    }
+
     /// Spent capabilities still being remembered, for T3.7's console counter.
     pub fn breakglass_spent(&self) -> usize {
         self.breakglass.spent_nonces()

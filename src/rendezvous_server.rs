@@ -163,6 +163,12 @@ impl RendezvousServer {
         // reqwest client the whole process then shares.
         let authorizer = Arc::new(Authorizer::new(auth_config)?);
         let broker = Arc::new(BrokerLedger::new(broker_config));
+        // T3.6. Its own task, not part of any request path: the audit records
+        // are already durable on disk, so this only catches `apps/api` up once
+        // it is answering again. `None` when there is nothing to catch up to.
+        if let Some(reconciler) = authorizer.breakglass_reconciler() {
+            tokio::spawn(reconciler.run());
+        }
         let (key, sk) = Self::get_server_sk(key);
         let nat_port = port - 1;
         let ws_port = port + 2;

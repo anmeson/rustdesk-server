@@ -20,8 +20,9 @@ use harness::*;
 use hbb_common::{
     rendezvous_proto::*,
     sodiumoxide::crypto::sign,
-    tokio,
+    tokio::{self, time::sleep},
 };
+use std::time::Duration;
 
 /// `mint-breakglass.ts`, line for line.
 fn mint(sk: &sign::SecretKey, admin: &str, device: &str, exp: i64, nonce: &str) -> String {
@@ -292,5 +293,114 @@ async fn a_bad_public_key_refuses_to_start() {
     assert!(
         err.contains("BREAKGLASS_PUBKEY"),
         "hbbs died without naming the setting: {err}"
+    );
+}
+
+// ------------------------------------------------ T3.6: local-first audit
+
+/// Every use is on disk on the **hbbs host**, fsynced, before the connection is
+/// allowed — and it is there whether or not the api ever hears about it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_use_is_recorded_locally_during_the_outage() {
+    let (pubkey, sk) = keypair();
+    let s = hbbs(&armed_with_no_api(&pubkey)).await;
+    let mut b = register(s.port, "t36-dev-1").await;
+
+    let token = mint(&sk, "alice", "t36-dev-1", in_minutes(30), "t36-nonce-1");
+    assert!(
+        punch(s.port, &s.key, "t36-dev-1", &token, ConnType::DEFAULT_CONN, ALLOW_WAIT)
+            .await
+            .is_none(),
+        "break-glass was refused during the outage it exists for"
+    );
+    let _ = next_from_hbbs(&mut b).await;
+
+    // Relative path, so it lands in hbbs's working directory.
+    let audit = s.dir().join("breakglass-audit.log");
+    let text = std::fs::read_to_string(&audit).unwrap_or_default();
+    assert!(
+        text.contains("t36-nonce-1") && text.contains("\"outcome\":\"used\""),
+        "no local record of an emergency access; file was:\n{text}"
+    );
+    // Nothing acknowledged yet — the api has never answered.
+    assert!(
+        !s.dir().join("breakglass-audit.log.cursor").exists(),
+        "the cursor advanced without the api accepting anything"
+    );
+}
+
+/// The reconciliation itself: hbbs records during the outage, the api comes
+/// back, and the record is replayed without anybody asking.
+#[tokio::test(flavor = "multi_thread")]
+async fn records_are_replayed_once_the_api_comes_back() {
+    let (pubkey, sk) = keypair();
+    let (on, reply) = switchable();
+    let api = stub_by(reply).await;
+
+    let mut args = auth_args(&api);
+    args.push("--breakglass-pubkey".into());
+    args.push(pubkey.clone());
+    // Fast enough to watch, slow enough not to spin.
+    args.push("--breakglass-reconcile-sec".into());
+    args.push("1".into());
+    let s = hbbs(&args).await;
+    let mut b = register(s.port, "t36-dev-2").await;
+
+    let token = mint(&sk, "alice", "t36-dev-2", in_minutes(30), "t36-nonce-2");
+    assert!(
+        punch(s.port, &s.key, "t36-dev-2", &token, ConnType::DEFAULT_CONN, ALLOW_WAIT)
+            .await
+            .is_none()
+    );
+    let _ = next_from_hbbs(&mut b).await;
+
+    // While the api is answering 503, the cursor must not move — otherwise the
+    // record is marked delivered to a server that never got it.
+    let cursor = s.dir().join("breakglass-audit.log.cursor");
+    sleep(Duration::from_millis(2_500)).await;
+    assert!(!cursor.exists(), "the cursor advanced while the api was failing");
+
+    on.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let mut delivered = false;
+    for _ in 0..80 {
+        if cursor.exists() {
+            delivered = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(delivered, "the record was never replayed; hbbs log:\n{}", s.log());
+
+    // The api got the record, in the documented shape.
+    let posted = api
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.contains("/api/internal/breakglass/reconcile") && r.contains("t36-nonce-2"))
+        .cloned()
+        .expect("the reconcile POST never carried the record");
+    assert!(posted.contains("x-hbbs-secret"), "reconciliation went unauthenticated");
+    assert!(posted.contains("\"admin_id\":\"alice\""));
+    assert!(posted.contains("\"outcome\":\"used\""));
+
+    // And it stops being sent. Counted from the moment of delivery, not from
+    // the start: every tick during the outage POSTed this record too and was
+    // answered 503, which is the retry working rather than a duplicate.
+    let sent = |api: &Stub| {
+        api.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.contains("t36-nonce-2"))
+            .count()
+    };
+    let at_delivery = sent(&api);
+    sleep(Duration::from_millis(3_000)).await;
+    assert_eq!(
+        sent(&api),
+        at_delivery,
+        "the cursor did not stop an acknowledged record being replayed"
     );
 }

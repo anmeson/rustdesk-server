@@ -54,8 +54,27 @@
 //! Both are bounded by `exp`, which is minutes. Closing them properly means
 //! shared state between rendezvous servers, which is a much larger thing than
 //! the hole it would close.
+//!
+//! # Local-first auditing — T3.6
+//!
+//! Every use is appended and **fsynced** to a file on the hbbs host *before* the
+//! decision is returned, and only then replayed to `apps/api`. The ordering is
+//! the whole point: the reason an operator is on this path is that `apps/api` is
+//! not answering, so an audit that goes to `apps/api` first would fail in
+//! exactly the situation the feature exists for — and "every use is logged"
+//! would be quietly untrue precisely when it mattered.
+//!
+//! A use that cannot be written to that file is **refused**. That is a real
+//! tradeoff and it is made deliberately: an unauditable emergency access is the
+//! thing this design exists to prevent, and the failure it protects against —
+//! a full disk on the rendezvous host — has its own fix path that does not go
+//! through break-glass. `BREAKGLASS_AUDIT_REQUIRED=N` is the documented lever
+//! for an operator who disagrees at 3am, for the same reason `AUTH_FAIL_OPEN`
+//! exists: a lever beats a patched binary.
 
 use std::collections::HashMap;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -71,6 +90,22 @@ pub const PREFIX: &str = "bg.";
 const KEY_PUBKEY: &str = "BREAKGLASS_PUBKEY";
 const KEY_MAX_TTL_SEC: &str = "BREAKGLASS_MAX_TTL_SEC";
 const KEY_RATE_PER_MINUTE: &str = "BREAKGLASS_RATE_PER_MINUTE";
+const KEY_AUDIT_LOG: &str = "BREAKGLASS_AUDIT_LOG";
+const KEY_AUDIT_REQUIRED: &str = "BREAKGLASS_AUDIT_REQUIRED";
+const KEY_RECONCILE_SEC: &str = "BREAKGLASS_RECONCILE_SEC";
+
+/// Same name the api gives its own copy (`env.ts:46`), so the two files are
+/// recognisable as the same kind of thing on two different hosts. Relative to
+/// the working directory, like everything else hbbs writes.
+const DEFAULT_AUDIT_LOG: &str = "./breakglass-audit.log";
+
+/// How often the reconciler retries. Slow on purpose: the records are already
+/// durable on disk, so this is a catch-up, not a delivery path — and `apps/api`
+/// coming back up should not be met with a stampede.
+const DEFAULT_RECONCILE_SEC: u64 = 60;
+
+/// Records sent in one reconciliation POST.
+const RECONCILE_BATCH: usize = 200;
 
 /// A raw ed25519 public key is exactly this long. `keygen-breakglass.ts` strips
 /// the 12-byte DER SubjectPublicKeyInfo prefix before printing it, so what an
@@ -122,6 +157,11 @@ const REPLAYED: &str = "This emergency access code has already been used.";
 const RATE_LIMITED: &str = "Too many emergency access attempts. Please wait a minute.";
 /// hbbs-only: the api trusts its own minter, which enforces the same ceiling.
 const TOO_LONG_LIVED: &str = "Capability is valid for too long to be accepted.";
+/// hbbs-only (T3.6). Deliberately says the access could not be *recorded*
+/// rather than that it was refused: it points the operator at the host, which
+/// is where the fix is.
+const AUDIT_UNAVAILABLE: &str =
+    "Emergency access could not be recorded on the server, so it was refused.";
 
 #[derive(Clone)]
 pub struct BreakglassConfig {
@@ -130,6 +170,11 @@ pub struct BreakglassConfig {
     pub pubkey: Option<sign::PublicKey>,
     pub max_ttl: Duration,
     pub rate_per_minute: u32,
+    /// Where the local-first audit goes (T3.6).
+    pub audit_log: PathBuf,
+    /// Refuse a use that cannot be audited. See the module docs.
+    pub audit_required: bool,
+    pub reconcile_every: Duration,
 }
 
 impl Default for BreakglassConfig {
@@ -138,6 +183,9 @@ impl Default for BreakglassConfig {
             pubkey: None,
             max_ttl: Duration::from_secs(DEFAULT_MAX_TTL_SEC),
             rate_per_minute: DEFAULT_RATE_PER_MINUTE,
+            audit_log: PathBuf::from(DEFAULT_AUDIT_LOG),
+            audit_required: true,
+            reconcile_every: Duration::from_secs(DEFAULT_RECONCILE_SEC),
         }
     }
 }
@@ -151,6 +199,8 @@ impl std::fmt::Debug for BreakglassConfig {
             .field("enabled", &self.pubkey.is_some())
             .field("max_ttl", &self.max_ttl)
             .field("rate_per_minute", &self.rate_per_minute)
+            .field("audit_log", &self.audit_log)
+            .field("audit_required", &self.audit_required)
             .finish()
     }
 }
@@ -179,10 +229,26 @@ impl BreakglassConfig {
             None => defaults.rate_per_minute,
         };
 
+        let audit_log = get(KEY_AUDIT_LOG).unwrap_or_default();
+        let audit_log = audit_log.trim();
+        let audit_log = if audit_log.is_empty() {
+            defaults.audit_log
+        } else {
+            PathBuf::from(audit_log)
+        };
+        let audit_required = flag(&get, KEY_AUDIT_REQUIRED).unwrap_or(defaults.audit_required);
+        let reconcile_every = match number(&get, KEY_RECONCILE_SEC)? {
+            Some(secs) => Duration::from_secs(secs),
+            None => defaults.reconcile_every,
+        };
+
         Ok(Self {
             pubkey,
             max_ttl,
             rate_per_minute,
+            audit_log,
+            audit_required,
+            reconcile_every,
         })
     }
 
@@ -196,11 +262,23 @@ impl BreakglassConfig {
             return;
         }
         log::info!(
-            "break-glass is ARMED: {KEY_MAX_TTL_SEC}={} {KEY_RATE_PER_MINUTE}={}. \
+            "break-glass is ARMED: {KEY_MAX_TTL_SEC}={} {KEY_RATE_PER_MINUTE}={} \
+             {KEY_AUDIT_LOG}={} {KEY_AUDIT_REQUIRED}={} {KEY_RECONCILE_SEC}={}. \
              Every use is logged at warn level.",
             self.max_ttl.as_secs(),
             self.rate_per_minute,
+            self.audit_log.display(),
+            yn(self.audit_required),
+            self.reconcile_every.as_secs(),
         );
+        if !self.audit_required {
+            log::warn!(
+                "{KEY_AUDIT_REQUIRED}=N — an emergency access that cannot be written to \
+                 {} will be allowed anyway, and there will be no record of it on this host. \
+                 See TASK.md T3.6.",
+                self.audit_log.display()
+            );
+        }
     }
 }
 
@@ -252,6 +330,8 @@ struct Window {
 /// nonces have been spent, and how often each address has tried.
 pub struct Breakglass {
     config: BreakglassConfig,
+    /// Shared with the reconciler task, which reads what this writes.
+    audit: std::sync::Arc<AuditLog>,
     /// nonce → the `exp` it was minted with. Kept until then, which is exactly
     /// "inside the validity window": past `exp` the capability is refused by the
     /// expiry check anyway, so remembering it longer buys nothing and costs
@@ -263,8 +343,10 @@ pub struct Breakglass {
 
 impl Breakglass {
     pub fn new(config: BreakglassConfig) -> Self {
+        let audit = std::sync::Arc::new(AuditLog::new(&config.audit_log));
         Self {
             config,
+            audit,
             spent: Mutex::new(HashMap::new()),
             per_ip: Mutex::new(HashMap::new()),
             global: Mutex::new(Window {
@@ -281,6 +363,14 @@ impl Breakglass {
     /// Unspent capabilities currently remembered, for T3.7's console counter.
     pub fn spent_nonces(&self) -> usize {
         self.spent.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    pub fn audit(&self) -> std::sync::Arc<AuditLog> {
+        self.audit.clone()
+    }
+
+    pub fn reconcile_every(&self) -> Duration {
+        self.config.reconcile_every
     }
 
     /// The whole decision, with no network call and no lock held across one.
@@ -358,7 +448,40 @@ impl Breakglass {
             return Outcome::refuse(TOO_LONG_LIVED);
         }
 
-        if !self.spend(&cap.nonce, cap.exp, now) {
+        let first_use = self.spend(&cap.nonce, cap.exp, now);
+        let outcome = if first_use { OUTCOME_USED } else { OUTCOME_REPLAY };
+
+        // T3.6, and the order is the feature: the record is on disk and fsynced
+        // *before* this function returns, so it survives the power cut the
+        // operator may be breaking glass to investigate. Replays are recorded
+        // too — a replayed capability is exactly the kind of event somebody
+        // wants to see afterwards, and `services/breakglass.ts` files them the
+        // same way.
+        if let Err(err) = self.audit.append(&AuditRecord {
+            at: timestamp(),
+            admin_id: cap.admin_id.clone(),
+            to_id: to_id.to_owned(),
+            nonce: cap.nonce.clone(),
+            from_ip: from_ip.to_owned(),
+            outcome: outcome.to_owned(),
+        }) {
+            log::error!(
+                "could not write the break-glass audit to {}: {err}",
+                self.config.audit_log.display()
+            );
+            if self.config.audit_required {
+                // The nonce stays spent. Handing back a capability that is
+                // already burned would be worse than refusing: the operator
+                // would retry it and be told it was replayed, which points at
+                // the wrong problem entirely.
+                return Outcome::refuse(AUDIT_UNAVAILABLE);
+            }
+            log::warn!(
+                "{KEY_AUDIT_REQUIRED}=N: allowing an emergency access with no local record"
+            );
+        }
+
+        if !first_use {
             log::warn!(
                 "break-glass capability REPLAYED: admin {:?} device {to_id} from {from_ip}",
                 cap.admin_id
@@ -367,8 +490,7 @@ impl Breakglass {
         }
 
         // T3.5: every use, at warn level. This is the line an operator greps for
-        // when asking "did anyone use the emergency path last night", and until
-        // T3.6 lands it is the *only* record on the hbbs host.
+        // when asking "did anyone use the emergency path last night".
         log::warn!(
             "BREAK-GLASS USED: admin {:?} -> device {to_id} from {from_ip}, \
              expires in {}s, nonce {}",
@@ -481,6 +603,24 @@ fn parse_pubkey(raw: &str) -> ResultType<sign::PublicKey> {
         .ok_or_else(|| hbb_common::anyhow::anyhow!("{KEY_PUBKEY} is not a valid ed25519 key"))
 }
 
+/// `Y`/`N`, the same shape as the `AUTH_*` keys and `ALWAYS_USE_RELAY`.
+fn flag(get: &impl Fn(&str) -> Option<String>, name: &str) -> Option<bool> {
+    let value = get(name)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.eq_ignore_ascii_case("y") || value.eq_ignore_ascii_case("yes") || value == "1")
+}
+
+fn yn(value: bool) -> &'static str {
+    if value {
+        "Y"
+    } else {
+        "N"
+    }
+}
+
 fn number(get: &impl Fn(&str) -> Option<String>, name: &str) -> ResultType<Option<u64>> {
     let raw = get(name).unwrap_or_default();
     let raw = raw.trim();
@@ -494,6 +634,293 @@ fn number(get: &impl Fn(&str) -> Option<String>, name: &str) -> ResultType<Optio
         // a security check and a typo must not quietly restore the default.
         Err(_) => bail!("{name} must be a whole number, got {raw:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Local-first audit and reconciliation — TASK.md T3.6
+// ---------------------------------------------------------------------------
+
+/// One line of the audit log, and one element of a reconciliation POST.
+///
+/// Refusals that never got past the signature check are **not** recorded here.
+/// They are noise an unauthenticated internet-facing port can generate at will,
+/// and a file an attacker can grow is a file that stops being written when it
+/// matters. They are logged instead, where a rotation policy already applies.
+#[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+pub struct AuditRecord {
+    /// RFC3339 UTC. Written by hbbs, which may be the only clock that saw this.
+    pub at: String,
+    pub admin_id: String,
+    pub to_id: String,
+    pub nonce: String,
+    pub from_ip: String,
+    /// `used` or `replay`. The api's own file has no such field because its
+    /// unique index makes the distinction for it; hbbs has to say so itself, or
+    /// a reconciled replay is indistinguishable from a reconciled first use.
+    ///
+    /// `String` rather than `&'static str` so that `Deserialize` owns its data:
+    /// a borrowing field would tie every parsed record to the line buffer it
+    /// came from, which is reused for the next line.
+    pub outcome: String,
+}
+
+pub const OUTCOME_USED: &str = "used";
+pub const OUTCOME_REPLAY: &str = "replay";
+
+/// The append-only file, and the cursor saying how much of it `apps/api` has.
+///
+/// Two files rather than a rewritten one: the audit itself must never be
+/// rewritten, moved, or truncated by this process — an operator reading it
+/// during an outage is one of its two jobs — so progress is tracked beside it.
+/// A crash between a successful POST and the cursor write replays a record, and
+/// the api's unique index on `nonce` absorbs that; the other order would lose
+/// one, which is the failure that matters.
+pub struct AuditLog {
+    path: PathBuf,
+    cursor_path: PathBuf,
+    /// Serialises appends against each other and against the reconciler's read.
+    lock: Mutex<()>,
+}
+
+impl AuditLog {
+    pub fn new(path: &Path) -> Self {
+        let mut cursor_path = path.as_os_str().to_owned();
+        cursor_path.push(".cursor");
+        Self {
+            path: path.to_owned(),
+            cursor_path: PathBuf::from(cursor_path),
+            lock: Mutex::new(()),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Appends one record and **fsyncs** before returning.
+    ///
+    /// The fsync is the difference between this feature working and appearing
+    /// to: a buffered write is lost by the same power cut or kernel panic that
+    /// an operator was breaking glass to investigate. It costs a disk round trip
+    /// on a path that has already skipped an HTTP request, so the budget is
+    /// there.
+    pub fn append(&self, record: &AuditRecord) -> std::io::Result<()> {
+        let mut line = serde_json::to_vec(record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        line.push(b'\n');
+        let _guard = self.lock.lock();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        file.write_all(&line)?;
+        file.sync_all()
+    }
+
+    /// Records `apps/api` has not acknowledged, oldest first, with the byte
+    /// offset that follows the last of them.
+    fn pending(&self, limit: usize) -> std::io::Result<(u64, Vec<AuditRecord>)> {
+        let _guard = self.lock.lock();
+        let (start, marked) = self.cursor();
+        let mut file = std::fs::File::open(&self.path)?;
+        let len = file.metadata()?.len();
+        let prefix = Self::prefix_hash(&mut file)?;
+        // A truncated or replaced file — log rotation, or a hand-edit — must not
+        // leave the cursor pointing into a different file. Length alone cannot
+        // detect that: rotate, write one record of the same size, and the offset
+        // still lands exactly at the end, so the reconciler goes *silently*
+        // idle. The file is append-only, so its opening bytes never change while
+        // it is the same file; a changed prefix means a new one, and the cursor
+        // goes back to zero. Duplicates are free — the api's unique index
+        // absorbs them — and silence is not.
+        let replaced = marked.is_some_and(|m| m != prefix);
+        let start = if start > len || replaced { 0 } else { start };
+        file.seek(SeekFrom::Start(start))?;
+
+        use std::io::{BufRead, BufReader};
+        let mut reader = BufReader::new(file);
+        let mut offset = start;
+        let mut records = Vec::new();
+        let mut line = String::new();
+        while records.len() < limit {
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            // A partial final line means a crash mid-append. Stop before it and
+            // pick it up next tick, when it is either complete or overwritten.
+            if !line.ends_with('\n') {
+                break;
+            }
+            offset += read as u64;
+            match serde_json::from_str::<AuditRecord>(line.trim_end()) {
+                Ok(record) => records.push(record),
+                // Skipped, not retried forever: one unparseable line must not
+                // wedge every record behind it. It stays in the file.
+                Err(err) => log::warn!(
+                    "unparseable break-glass audit line at byte {}: {err}",
+                    offset - read as u64
+                ),
+            }
+        }
+        Ok((offset, records))
+    }
+
+    /// Identifies the file the offset belongs to.
+    ///
+    /// The log is append-only, so its opening bytes are fixed for as long as it
+    /// is the same file. Hashing them is a portable stand-in for an inode —
+    /// `MetadataExt::ino` is not available on the Windows build.
+    fn prefix_hash(file: &mut std::fs::File) -> std::io::Result<String> {
+        use std::io::Read;
+        let here = file.stream_position()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut head = [0u8; 256];
+        let mut filled = 0;
+        while filled < head.len() {
+            match file.read(&mut head[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        file.seek(SeekFrom::Start(here))?;
+        let digest = sodiumoxide::crypto::hash::sha256::hash(&head[..filled]);
+        Ok(digest.0.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    /// `(offset, prefix hash)`. The hash is `None` for a hand-written cursor
+    /// holding a bare number, which is then trusted as-is.
+    fn cursor(&self) -> (u64, Option<String>) {
+        let Ok(text) = std::fs::read_to_string(&self.cursor_path) else {
+            return (0, None);
+        };
+        let mut parts = text.trim().split_whitespace();
+        let offset = parts.next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+        (offset, parts.next().map(str::to_owned))
+    }
+
+    /// Fsynced too. A cursor that is lost re-sends records the api already has,
+    /// which its unique index absorbs; a cursor that is *ahead* of what the api
+    /// received would lose them silently.
+    fn set_cursor(&self, offset: u64) -> std::io::Result<()> {
+        let prefix = match std::fs::File::open(&self.path) {
+            Ok(mut file) => Self::prefix_hash(&mut file)?,
+            Err(_) => String::new(),
+        };
+        let mut file = std::fs::File::create(&self.cursor_path)?;
+        file.write_all(format!("{offset} {prefix}").as_bytes())?;
+        file.sync_all()
+    }
+
+    /// Unreconciled records, for T3.7's console counter.
+    pub fn pending_count(&self) -> usize {
+        self.pending(usize::MAX).map(|(_, r)| r.len()).unwrap_or(0)
+    }
+}
+
+/// Replays the local audit to `apps/api` once it is answering again — T3.6.
+///
+/// Runs as its own task, ticking slowly. Nothing depends on it being prompt:
+/// the records are already durable, and this is the catch-up, not the delivery
+/// path. It is also deliberately dumb — read a batch, POST it, advance the
+/// cursor — because the interesting failure is not "the POST failed" (it will,
+/// that is the premise) but "the cursor advanced past something the api never
+/// received", so the cursor moves only after a 2xx.
+pub struct Reconciler {
+    audit: std::sync::Arc<AuditLog>,
+    client: reqwest::Client,
+    url: String,
+    secret: String,
+    every: Duration,
+}
+
+/// `POST` target on the api server. `apps/api/src/routes/internal/breakglass.ts`.
+pub const RECONCILE_PATH: &str = "/api/internal/breakglass/reconcile";
+
+impl Reconciler {
+    /// `None` when there is nothing to reconcile *to* — break-glass disarmed, or
+    /// no api configured. Both are ordinary, and neither should spawn a task
+    /// that wakes up forever to do nothing.
+    pub fn new(
+        audit: std::sync::Arc<AuditLog>,
+        api_url: &str,
+        api_secret: &str,
+        timeout: Duration,
+        every: Duration,
+        armed: bool,
+    ) -> Option<Self> {
+        if !armed || api_url.is_empty() || api_secret.is_empty() {
+            return None;
+        }
+        let client = reqwest::Client::builder()
+            // Generous next to the 300 ms connect budget: nobody is waiting on
+            // this, and a slow api is better caught up with than given up on.
+            .timeout(timeout.max(Duration::from_secs(5)))
+            .no_proxy()
+            .user_agent(format!("hbbs/{}", crate::version::VERSION))
+            .build()
+            .ok()?;
+        Some(Self {
+            audit,
+            client,
+            url: format!("{api_url}{RECONCILE_PATH}"),
+            secret: api_secret.to_owned(),
+            every,
+        })
+    }
+
+    /// Never returns. Spawn it.
+    pub async fn run(self) {
+        let mut ticker = hbb_common::tokio::time::interval(self.every);
+        // The default `Burst` behaviour would fire back-to-back ticks to catch
+        // up after a long api outage, which is the one moment a stampede is
+        // least welcome.
+        ticker.set_missed_tick_behavior(hbb_common::tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match self.tick().await {
+                Ok(0) => {}
+                Ok(n) => log::info!("reconciled {n} break-glass audit record(s) to the api"),
+                Err(err) => log::debug!("break-glass reconciliation deferred: {err:#}"),
+            }
+        }
+    }
+
+    /// One batch. Returns how many records the api accepted.
+    pub async fn tick(&self) -> ResultType<usize> {
+        let audit = self.audit.clone();
+        // The read is blocking file I/O, and this runs on the same runtime that
+        // brokers connections.
+        let (offset, records) =
+            hbb_common::tokio::task::spawn_blocking(move || audit.pending(RECONCILE_BATCH)).await??;
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let count = records.len();
+        let response = self
+            .client
+            .post(&self.url)
+            .header(SECRET_HEADER, &self.secret)
+            .json(&serde_json::json!({ "uses": records }))
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("{RECONCILE_PATH} answered {status}");
+        }
+        let audit = self.audit.clone();
+        hbb_common::tokio::task::spawn_blocking(move || audit.set_cursor(offset)).await??;
+        Ok(count)
+    }
+}
+
+/// The header `apps/api` authenticates hbbs with, shared with `auth.rs`.
+const SECRET_HEADER: &str = "x-hbbs-secret";
+
+/// Timestamp in the shape `apps/api` stores, and a human reads.
+pub fn timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// Mints a capability the way `apps/api/src/scripts/mint-breakglass.ts` does.
@@ -546,9 +973,26 @@ mod tests {
         mint_for_test(sk, admin, device, exp, nonce)
     }
 
+    /// Every `Breakglass` in these tests writes a real audit file, because
+    /// `decide` refuses a use it cannot record (T3.6) — so each needs a path of
+    /// its own, or tests running in parallel would interleave their records.
+    fn temp_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "bg-{tag}-{}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
     fn armed(pk: sign::PublicKey) -> Breakglass {
         Breakglass::new(BreakglassConfig {
             pubkey: Some(pk),
+            audit_log: temp_path("armed"),
             ..Default::default()
         })
     }
@@ -707,6 +1151,7 @@ mod tests {
         let bg = Breakglass::new(BreakglassConfig {
             pubkey: Some(pk),
             rate_per_minute: 3,
+            audit_log: temp_path("rate"),
             ..Default::default()
         });
         for i in 0..3 {
@@ -771,5 +1216,264 @@ mod tests {
             bg.decide(&format!("{PREFIX}{payload_b64}.{padded}"), "dev-1", "1.2.3.4"),
             Outcome::Allow(_)
         ));
+    }
+
+    // ----------------------------------------------------------- T3.6
+
+    fn read_lines(path: &Path) -> Vec<AuditRecord> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str::<AuditRecord>(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn every_use_is_on_disk_before_the_decision_comes_back() {
+        let (pk, sk) = keypair();
+        let path = temp_path("local-first");
+        let bg = Breakglass::new(BreakglassConfig {
+            pubkey: Some(pk),
+            audit_log: path.clone(),
+            ..Default::default()
+        });
+
+        let token = mint(&sk, "alice", "dev-1", in_mins(10), "audit-1");
+        assert!(matches!(bg.decide(&token, "dev-1", "203.0.113.9"), Outcome::Allow(_)));
+
+        // Read straight after the call returns — no flush, no sleep. That is
+        // the property: the record is durable by the time the connection is.
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].admin_id, "alice");
+        assert_eq!(lines[0].to_id, "dev-1");
+        assert_eq!(lines[0].nonce, "audit-1");
+        assert_eq!(lines[0].from_ip, "203.0.113.9");
+        assert_eq!(lines[0].outcome, OUTCOME_USED);
+    }
+
+    #[test]
+    fn a_replay_is_recorded_too() {
+        // A replayed capability is exactly the kind of event somebody wants to
+        // see afterwards, so it is filed rather than filtered.
+        let (pk, sk) = keypair();
+        let path = temp_path("replay");
+        let bg = Breakglass::new(BreakglassConfig {
+            pubkey: Some(pk),
+            audit_log: path.clone(),
+            ..Default::default()
+        });
+        let token = mint(&sk, "alice", "dev-1", in_mins(10), "audit-2");
+
+        assert!(matches!(bg.decide(&token, "dev-1", "ip"), Outcome::Allow(_)));
+        assert_eq!(bg.decide(&token, "dev-1", "ip"), Outcome::refuse(REPLAYED));
+
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].outcome, OUTCOME_USED);
+        assert_eq!(lines[1].outcome, OUTCOME_REPLAY);
+    }
+
+    #[test]
+    fn refusals_that_never_verified_are_not_written_to_the_file() {
+        // This file is reachable by anyone who can open a TCP connection to the
+        // rendezvous port. A file an attacker can grow is a file that stops
+        // being writable when it matters.
+        let (pk, sk) = keypair();
+        let (_, other_sk) = keypair();
+        let path = temp_path("noise");
+        let bg = Breakglass::new(BreakglassConfig {
+            pubkey: Some(pk),
+            audit_log: path.clone(),
+            ..Default::default()
+        });
+
+        let forged = mint(&other_sk, "mallory", "dev-1", in_mins(10), "audit-3");
+        assert_eq!(bg.decide(&forged, "dev-1", "ip"), Outcome::refuse(BAD_SIGNATURE));
+        assert_eq!(bg.decide("bg.nonsense", "dev-1", "ip"), Outcome::refuse(MALFORMED));
+        let expired = mint(&sk, "alice", "dev-1", in_mins(-1), "audit-4");
+        assert_eq!(bg.decide(&expired, "dev-1", "ip"), Outcome::refuse(EXPIRED));
+
+        assert!(read_lines(&path).is_empty());
+    }
+
+    #[test]
+    fn a_use_that_cannot_be_recorded_is_refused() {
+        // The tradeoff stated in the module docs, as an assertion. The path is
+        // a **directory**, so every append fails.
+        let (pk, sk) = keypair();
+        let dir = temp_path("unwritable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bg = Breakglass::new(BreakglassConfig {
+            pubkey: Some(pk),
+            audit_log: dir.clone(),
+            ..Default::default()
+        });
+
+        let token = mint(&sk, "alice", "dev-1", in_mins(10), "audit-5");
+        assert_eq!(
+            bg.decide(&token, "dev-1", "ip"),
+            Outcome::refuse(AUDIT_UNAVAILABLE)
+        );
+
+        // …and `BREAKGLASS_AUDIT_REQUIRED=N` is the documented lever.
+        let bg = Breakglass::new(BreakglassConfig {
+            pubkey: Some(pk),
+            audit_log: dir.clone(),
+            audit_required: false,
+            ..Default::default()
+        });
+        let token = mint(&sk, "alice", "dev-1", in_mins(10), "audit-6");
+        assert!(matches!(bg.decide(&token, "dev-1", "ip"), Outcome::Allow(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cursor_is_what_stops_a_record_being_sent_twice() {
+        let path = temp_path("cursor");
+        let log = AuditLog::new(&path);
+        for i in 0..3 {
+            log.append(&AuditRecord {
+                at: timestamp(),
+                admin_id: "alice".into(),
+                to_id: "dev-1".into(),
+                nonce: format!("n{i}"),
+                from_ip: "ip".into(),
+                outcome: OUTCOME_USED.to_owned(),
+            })
+            .unwrap();
+        }
+
+        let (offset, pending) = log.pending(10).unwrap();
+        assert_eq!(pending.len(), 3);
+        assert_eq!(log.pending_count(), 3);
+
+        log.set_cursor(offset).unwrap();
+        assert_eq!(log.pending(10).unwrap().1.len(), 0);
+
+        // A new record after the cursor is the only thing sent next time.
+        log.append(&AuditRecord {
+            at: timestamp(),
+            admin_id: "alice".into(),
+            to_id: "dev-1".into(),
+            nonce: "n3".into(),
+            from_ip: "ip".into(),
+            outcome: OUTCOME_USED.to_owned(),
+        })
+        .unwrap();
+        let (_, pending) = log.pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].nonce, "n3");
+    }
+
+    #[test]
+    fn a_batch_limit_leaves_the_rest_for_the_next_tick() {
+        let path = temp_path("batch");
+        let log = AuditLog::new(&path);
+        for i in 0..5 {
+            log.append(&AuditRecord {
+                at: timestamp(),
+                admin_id: "alice".into(),
+                to_id: "dev-1".into(),
+                nonce: format!("b{i}"),
+                from_ip: "ip".into(),
+                outcome: OUTCOME_USED.to_owned(),
+            })
+            .unwrap();
+        }
+        let (offset, first) = log.pending(2).unwrap();
+        assert_eq!(first.len(), 2);
+        log.set_cursor(offset).unwrap();
+        let (_, second) = log.pending(2).unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].nonce, "b2");
+    }
+
+    #[test]
+    fn a_truncated_file_replays_rather_than_going_silent() {
+        // Log rotation, or a hand-edit. A cursor past the end would otherwise
+        // leave the reconciler idle forever with records it never sent.
+        let path = temp_path("rotated");
+        let log = AuditLog::new(&path);
+        log.append(&AuditRecord {
+            at: timestamp(),
+            admin_id: "alice".into(),
+            to_id: "dev-1".into(),
+            nonce: "r0".into(),
+            from_ip: "ip".into(),
+            outcome: OUTCOME_USED.to_owned(),
+        })
+        .unwrap();
+        let (offset, _) = log.pending(10).unwrap();
+        log.set_cursor(offset).unwrap();
+
+        std::fs::write(&path, b"").unwrap();
+        log.append(&AuditRecord {
+            at: timestamp(),
+            admin_id: "alice".into(),
+            to_id: "dev-1".into(),
+            nonce: "r1".into(),
+            from_ip: "ip".into(),
+            outcome: OUTCOME_USED.to_owned(),
+        })
+        .unwrap();
+
+        let (_, pending) = log.pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].nonce, "r1");
+    }
+
+    #[test]
+    fn a_half_written_line_is_left_for_the_next_tick() {
+        // A crash mid-append. Sending a truncated record would be worse than
+        // waiting for the process that is writing it.
+        let path = temp_path("partial");
+        let log = AuditLog::new(&path);
+        log.append(&AuditRecord {
+            at: timestamp(),
+            admin_id: "alice".into(),
+            to_id: "dev-1".into(),
+            nonce: "p0".into(),
+            from_ip: "ip".into(),
+            outcome: OUTCOME_USED.to_owned(),
+        })
+        .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(br#"{"at":"2026-09-15T00:00:00Z","admin_i"#).unwrap();
+        drop(f);
+
+        let (_, pending) = log.pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].nonce, "p0");
+    }
+
+    #[test]
+    fn an_unparseable_line_does_not_wedge_the_records_behind_it() {
+        let path = temp_path("garbage");
+        let log = AuditLog::new(&path);
+        std::fs::write(&path, b"this is not json\n").unwrap();
+        log.append(&AuditRecord {
+            at: timestamp(),
+            admin_id: "alice".into(),
+            to_id: "dev-1".into(),
+            nonce: "g0".into(),
+            from_ip: "ip".into(),
+            outcome: OUTCOME_USED.to_owned(),
+        })
+        .unwrap();
+
+        let (_, pending) = log.pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].nonce, "g0");
+    }
+
+    #[test]
+    fn there_is_no_reconciler_without_somewhere_to_reconcile_to() {
+        let log = std::sync::Arc::new(AuditLog::new(&temp_path("none")));
+        let some = Duration::from_secs(60);
+        assert!(Reconciler::new(log.clone(), "http://api", "s", some, some, false).is_none());
+        assert!(Reconciler::new(log.clone(), "", "s", some, some, true).is_none());
+        assert!(Reconciler::new(log.clone(), "http://api", "", some, some, true).is_none());
+        assert!(Reconciler::new(log, "http://api", "s", some, some, true).is_some());
     }
 }

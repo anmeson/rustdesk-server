@@ -99,6 +99,9 @@ cannot identify a session, so `hbbs` is the sole enforcement point
 | S20 | applied 2026-09-15 (T3.5) | `src/auth.rs` (`Authorizer` field, `new` / `new_with`, the branch in `authorize`) | a `bg.`-prefixed token is decided by `Breakglass` before the api is consulted, and **after** the decision cache so a punch retry is not a replay; the nonce becomes the `conn_audit_ref`; `DecisionSource::Breakglass` | every caller of `authorize` gets the emergency path for free and none of them has to know the token format — both chokepoints (S5, S8) were already calling it | Structural (small) | low — our own module |
 | S21 | applied 2026-09-15 (T3.5) | `src/main.rs` (`:35-37`) | three `--breakglass-*` rows in the clap arg string | same | Structural (small) | ⚠ medium — same arg string as S2 and S14 |
 | S22 | applied 2026-09-15 (T3.5) | `tests/t35_breakglass.rs` (new), `tests/harness/mod.rs` (`hbbs_expect_exit`, `wait_for_log`, stdout captured) | 7 tests against the real binary: authorizes while the api is down, never asks a healthy api, expired / wrong-device / forged / over-long refused, replay refused, punch retry not a replay, disarmed by default, a bad key refuses to boot | a 🔴 path that bypasses every authorization check needs proof it cannot be bypassed itself | Isolated | low |
+| S23 | applied 2026-09-15 (T3.6) | `src/breakglass.rs` (`AuditLog`, `AuditRecord`, `Reconciler`, three more config keys) | every use appended and **fsynced** before the decision returns; a use that cannot be written is refused; a slow background task replays unacknowledged records to `POST /api/internal/breakglass/reconcile`, tracked by a cursor file that carries a hash of the log's opening bytes | the reason an operator is on this path is that `apps/api` is down, so an audit that went there first would fail exactly when it mattered — "every use is logged" would be quietly untrue | Isolated | low — `chrono`, `reqwest` and `serde_json` were already dependencies |
+| S24 | applied 2026-09-15 (T3.6) | `src/rendezvous_server.rs` (`start_with_bind`), `src/auth.rs` (`breakglass_reconciler`), `src/main.rs` (`:38-40`) | the reconciler spawned as its own task, and three `--breakglass-audit-*` / `--breakglass-reconcile-sec` rows | it is not on any request path — the records are already durable, this only catches `apps/api` up | Structural (small) | ⚠ medium — same arg string as S2, S14, S21 |
+| S25 | applied 2026-09-15 (T3.6) | `tests/t35_breakglass.rs`, `tests/harness/mod.rs` (`dir()`, `switchable()`) | 2 more integration tests — the record is on disk during the outage and the cursor has not moved; the api recovers and the record is replayed exactly once — plus 9 unit tests over the log and cursor | the failure this guards against is silent by nature: a record that is never written, or a cursor that advances past one the api never got | Isolated | low |
 
 ### Notes on the `S` rows
 
@@ -166,6 +169,14 @@ keeps its own independent copy of the minter for exactly that reason: a shared
 helper would let hbbs and its tests agree with each other while both disagreed
 with production.
 
+**S23's cursor is a byte offset plus a prefix hash, and the hash is not
+decoration.** A byte offset alone cannot survive log rotation: rotate the file,
+write one record of the same size, and the offset lands exactly at the new end —
+so the reconciler goes *silently* idle with records it never sent. The log is
+append-only, so its opening bytes are fixed while it is the same file; a changed
+hash means a new one and the cursor resets. An inode would be the obvious
+answer, and `MetadataExt::ino` is not on the Windows build.
+
 **`libs/hbb_common` is untouched** and should stay that way. Everything above
 uses the proto exactly as upstream ships it: no field was added, and no field
 changed meaning. That is what keeps "no proto change, no client change" true.
@@ -179,5 +190,4 @@ changed meaning. That is what keeps "no proto change, no client change" true.
 | The relay-fallback `RelayResponse` (`handle_tcp`) | carries **no id** — `create_relay` sends it with `initiate = false` (`apps/rustdesk/src/rendezvous_mediator.rs:579-604`) — so S17's id layer has nothing to check and only `BROKER_STRICT_IP`, which ships off, separates a stranger's ack from the real peer's. It steers the controller nowhere (A keeps its own uuid and relay server, `client.rs:1750-1760`), so this is a race and not a redirection. Pinned by `the_relay_fallback_ack_carries_no_id_and_still_reaches_the_controller` (S18) | residual of **T3.8** |
 | `BROKER_STRICT_IP` (S17) | implemented and **never run against two real devices on a real network**. The loopback harness cannot reach it — every party there shares 127.0.0.1 — so it is covered only by unit tests over `BrokerLedger::check`. The dual-stack and CGNAT cases the default protects against are therefore predicted, not observed | **T5.2** / **T5.10** |
 | `breakglass::Breakglass` nonce store (S19) | **per process**: a capability spent against one hbbs can be spent again against another, or against the same one after a restart. Bounded by `exp` (minutes). Closing it means shared state between rendezvous servers | accepted, documented |
-| Break-glass audit (S19) | a use is `log::warn!`ed and nothing more. The api is never told, so `breakglassUses` has no row — and the log is the only record on the host | **T3.6** |
 | `RegisterPk` (`:371-455`) | answers `OK` for any well-formed request: an unenrolled device can still claim an id and appear online | **T3.5.2** |
