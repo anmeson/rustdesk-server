@@ -155,6 +155,23 @@ impl Hbbs {
     pub fn log(&self) -> String {
         std::fs::read_to_string(self._dir.path().join("hbbs.log")).unwrap_or_default()
     }
+
+    /// Waits for `needle` to appear in the log, up to `ms`.
+    ///
+    /// Polling rather than a single read, because `main` starts flexi_logger
+    /// with `WriteMode::Async` (`src/main.rs:20`): the line exists in the
+    /// process before it exists in the file, and how long that gap is depends
+    /// on the flush interval and the load on the machine. A bare read here was
+    /// a test that passed alone and failed in a full run.
+    pub async fn wait_for_log(&self, needle: &str, ms: u64) -> bool {
+        for _ in 0..(ms / 50).max(1) {
+            if self.log().contains(needle) {
+                return true;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
 }
 
 impl Drop for Hbbs {
@@ -239,9 +256,18 @@ pub async fn hbbs_with_key(key: &str, extra: &[String]) -> Hbbs {
         .arg(port.to_string())
         .arg("-k")
         .arg(key)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(
+        // Both streams into one file. `main` logs to **stdout**
+        // (`Logger::log_to_stdout`), so nulling it — as this harness did until
+        // T3.5 needed to assert on a log line — threw away every log hbbs
+        // writes and left `log()` holding only the panic channel.
+        .stdout(Stdio::from(
             std::fs::File::create(dir.path().join("hbbs.log")).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::options()
+                .append(true)
+                .open(dir.path().join("hbbs.log"))
+                .unwrap(),
         ));
     for a in extra {
         cmd.arg(a);
@@ -298,6 +324,55 @@ pub async fn hbbs_with_key(key: &str, extra: &[String]) -> Hbbs {
     }
     assert!(ready, "hbbs never accepted TCP on {port}");
     s
+}
+
+/// Spawns `hbbs` expecting it **not** to start, and returns what it printed.
+///
+/// Every config value that bounds a security check is validated before any port
+/// binds, so "hbbs refused to start" is a designed outcome and needs asserting
+/// like any other. Panics if it starts anyway — a server that boots on a
+/// misconfigured security setting is the failure, not the timeout.
+pub async fn hbbs_expect_exit(extra: &[String]) -> String {
+    let dir = TempDir::new();
+    let port = free_port_block();
+    let bin = std::env::current_dir().unwrap().join("target/debug/hbbs");
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(dir.path())
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", dir.path())
+        .env("TEST_HBBS", "no")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-k")
+        .arg("_")
+        .stdout(Stdio::from(
+            std::fs::File::create(dir.path().join("hbbs.log")).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::options()
+                .append(true)
+                .open(dir.path().join("hbbs.log"))
+                .unwrap(),
+        ));
+    for a in extra {
+        cmd.arg(a);
+    }
+    let mut child = cmd.spawn().unwrap();
+    for _ in 0..200 {
+        if let Ok(Some(status)) = child.try_wait() {
+            let log = std::fs::read_to_string(dir.path().join("hbbs.log")).unwrap_or_default();
+            assert!(!status.success(), "hbbs exited cleanly instead of refusing:\n{log}");
+            return log;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!(
+        "hbbs started with a configuration it should have refused:\n{}",
+        std::fs::read_to_string(dir.path().join("hbbs.log")).unwrap_or_default()
+    );
 }
 
 /// Registers device B and keeps its UDP socket, which is where hbbs forwards.

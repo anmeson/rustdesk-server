@@ -95,6 +95,10 @@ cannot identify a session, so `hbbs` is the sole enforcement point
 | S16 | applied 2026-09-15 (T3.8) | `src/rendezvous_server.rs` (in `handle_punch_hole_request`, beside the `PUNCH_REQS` ring; and at the tail of `handle_request_relay`) | two `broker.record(try_into_v4(addr), peer_id, try_into_v4(peer_addr).ip())` calls, at the two points where hbbs actually introduces a controller to a peer | there is no third place a brokerage begins. The relay one is separate because the fallback arrives on a **fresh TCP connection** (`client.rs:1720`), so A waits at an address the punch path never wrote down | Isolated | ⚠ medium — must stay on the *allow* side of S5/S8, or a refused connection becomes answerable |
 | S17 | applied 2026-09-15 (T3.8) | `src/rendezvous_server.rs` (`handle_hole_sent`, `handle_local_addr`, the `RelayResponse` arm in `handle_tcp`) | `broker.check(...)` before each forward; a `Verdict::Drop` returns without forwarding and without touching the sink | **this is the fix.** Without it a stranger who knows a waiting controller's address answers in the peer's place — and by naming an id hbbs does not know, hands A an empty peer key, which the client reads as "no identity to verify" (`apps/rustdesk/src/client.rs:1624-1634`) | Structural | ⚠ **high** — three separate sites in a file upstream reorders freely |
 | S18 | applied 2026-09-15 (T3.8) | `tests/t33_chokepoint.rs` | `a_stranger_can_still_answer_a_waiting_controller` rewritten to assert the fix, plus 5 tests: the brokered peer still gets through, `LocalAddr` and id-bearing `RelayResponse` refused, the id-less fallback ack still forwarded, and `BROKER_VERIFY=N` restoring upstream's routing | a 🔴 change to the routing every brokered connection depends on | Isolated | low |
+| S19 | applied 2026-09-15 (T3.5) | `src/breakglass.rs` (new), `src/lib.rs` (`pub mod breakglass;`) | ed25519 capability verification — `bg.<b64(payload)>.<b64(sig)>`, nonce store, per-ip and global rate limits, an `exp` ceiling — plus `BreakglassConfig` (`BREAKGLASS_PUBKEY` / `_MAX_TTL_SEC` / `_RATE_PER_MINUTE`) | decision D1's escape hatch: fail-closed means an `apps/api` outage locks you out of the machine you would fix it from. Verified **locally**, with no api call, because the api being down is the premise | Isolated | low — `sodiumoxide`, `base64` and `serde_json` were already dependencies |
+| S20 | applied 2026-09-15 (T3.5) | `src/auth.rs` (`Authorizer` field, `new` / `new_with`, the branch in `authorize`) | a `bg.`-prefixed token is decided by `Breakglass` before the api is consulted, and **after** the decision cache so a punch retry is not a replay; the nonce becomes the `conn_audit_ref`; `DecisionSource::Breakglass` | every caller of `authorize` gets the emergency path for free and none of them has to know the token format — both chokepoints (S5, S8) were already calling it | Structural (small) | low — our own module |
+| S21 | applied 2026-09-15 (T3.5) | `src/main.rs` (`:35-37`) | three `--breakglass-*` rows in the clap arg string | same | Structural (small) | ⚠ medium — same arg string as S2 and S14 |
+| S22 | applied 2026-09-15 (T3.5) | `tests/t35_breakglass.rs` (new), `tests/harness/mod.rs` (`hbbs_expect_exit`, `wait_for_log`, stdout captured) | 7 tests against the real binary: authorizes while the api is down, never asks a healthy api, expired / wrong-device / forged / over-long refused, replay refused, punch retry not a replay, disarmed by default, a bad key refuses to boot | a 🔴 path that bypasses every authorization check needs proof it cannot be bypassed itself | Isolated | low |
 
 ### Notes on the `S` rows
 
@@ -153,6 +157,15 @@ connections and then refuses every answer to them — "nobody can connect", with
 the cause in a log line nobody is reading yet. `the_brokered_peer_still_answers_its_waiting_controller`
 (S18) is the test that catches it.
 
+**S19 re-implements a wire format it does not own.** `mint-breakglass.ts`
+mints capabilities, `services/breakglass.ts` verifies them, and this is the
+third implementation of the same three lines. The detail that breaks silently is
+that **the signature covers the base64url payload text, not the decoded JSON** —
+both readings are plausible and only one has a test. `tests/t35_breakglass.rs`
+keeps its own independent copy of the minter for exactly that reason: a shared
+helper would let hbbs and its tests agree with each other while both disagreed
+with production.
+
 **`libs/hbb_common` is untouched** and should stay that way. Everything above
 uses the proto exactly as upstream ships it: no field was added, and no field
 changed meaning. That is what keeps "no proto change, no client change" true.
@@ -165,4 +178,6 @@ changed meaning. That is what keeps "no proto change, no client change" true.
 |---|---|---|
 | The relay-fallback `RelayResponse` (`handle_tcp`) | carries **no id** — `create_relay` sends it with `initiate = false` (`apps/rustdesk/src/rendezvous_mediator.rs:579-604`) — so S17's id layer has nothing to check and only `BROKER_STRICT_IP`, which ships off, separates a stranger's ack from the real peer's. It steers the controller nowhere (A keeps its own uuid and relay server, `client.rs:1750-1760`), so this is a race and not a redirection. Pinned by `the_relay_fallback_ack_carries_no_id_and_still_reaches_the_controller` (S18) | residual of **T3.8** |
 | `BROKER_STRICT_IP` (S17) | implemented and **never run against two real devices on a real network**. The loopback harness cannot reach it — every party there shares 127.0.0.1 — so it is covered only by unit tests over `BrokerLedger::check`. The dual-stack and CGNAT cases the default protects against are therefore predicted, not observed | **T5.2** / **T5.10** |
+| `breakglass::Breakglass` nonce store (S19) | **per process**: a capability spent against one hbbs can be spent again against another, or against the same one after a restart. Bounded by `exp` (minutes). Closing it means shared state between rendezvous servers | accepted, documented |
+| Break-glass audit (S19) | a use is `log::warn!`ed and nothing more. The api is never told, so `breakglassUses` has no row — and the log is the only record on the host | **T3.6** |
 | `RegisterPk` (`:371-455`) | answers `OK` for any well-formed request: an unenrolled device can still claim an id and appear online | **T3.5.2** |

@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use hbb_common::{bail, log, protobuf::EnumOrUnknown, rendezvous_proto::ConnType, ResultType};
 use sodiumoxide::crypto::hash::sha256;
 
+use crate::breakglass::{self, Breakglass, BreakglassConfig, Outcome};
 use crate::common::get_arg_opt;
 
 /// A human is waiting on this for every connection — T3.2's latency budget.
@@ -304,6 +305,9 @@ pub enum DecisionSource {
     FailedClosed,
     /// No answer could be obtained and `AUTH_FAIL_OPEN` is on. Unsupported.
     FailedOpen,
+    /// A break-glass capability, verified locally without asking the api at all
+    /// — which is the point of it (T3.5).
+    Breakglass,
 }
 
 impl DecisionSource {
@@ -315,6 +319,7 @@ impl DecisionSource {
             Self::Cache => "cache",
             Self::FailedClosed => "fail-closed",
             Self::FailedOpen => "fail-open",
+            Self::Breakglass => "break-glass",
         }
     }
 }
@@ -459,11 +464,29 @@ pub struct Authorizer {
     /// call by accident.
     client: Option<reqwest::Client>,
     cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    /// The emergency path (T3.5). Lives here rather than beside the api client
+    /// because it is the *same decision*, reached without one — every caller
+    /// that asks `authorize` gets break-glass handled for free, and none of them
+    /// has to know the token format.
+    breakglass: Breakglass,
 }
 
 impl Authorizer {
     /// Call from inside the tokio runtime — the client it builds belongs to one.
     pub fn new(config: AuthConfig) -> ResultType<Self> {
+        // Read here rather than threaded in from `main`, but still before any
+        // port binds — `Authorizer::new` is called first in `start_with_bind` —
+        // so a mistyped `BREAKGLASS_PUBKEY` is a refusal to start. Discovering
+        // it during the outage it exists for is the one unacceptable outcome.
+        let breakglass_config = BreakglassConfig::from_args()?;
+        breakglass_config.log();
+        Self::new_with(config, breakglass_config)
+    }
+
+    /// The break-glass settings passed in rather than read from the process
+    /// environment. Tests only: the environment is global, and a test that
+    /// mutated it would race every other test in the binary.
+    pub fn new_with(config: AuthConfig, breakglass: BreakglassConfig) -> ResultType<Self> {
         let client = if config.required {
             Some(build_client(&config)?)
         } else {
@@ -473,7 +496,17 @@ impl Authorizer {
             config,
             client,
             cache: Mutex::new(HashMap::new()),
+            breakglass: Breakglass::new(breakglass),
         })
+    }
+
+    pub fn breakglass_armed(&self) -> bool {
+        self.breakglass.enabled()
+    }
+
+    /// Spent capabilities still being remembered, for T3.7's console counter.
+    pub fn breakglass_spent(&self) -> usize {
+        self.breakglass.spent_nonces()
     }
 
     pub fn enabled(&self) -> bool {
@@ -543,7 +576,51 @@ impl Authorizer {
 
         let key = CacheKey::new(token, req.to_id, req.conn_type);
         if let Some(entry) = self.cached(&key) {
-            return entry.decision(DecisionSource::Cache, started.elapsed());
+            let source = if entry.breakglass {
+                DecisionSource::Breakglass
+            } else {
+                DecisionSource::Cache
+            };
+            return entry.decision(source, started.elapsed());
+        }
+
+        // The emergency path — T3.5, decision D1. Checked *before* the api call
+        // and answered without one, because the situation it exists for is the
+        // api being unreachable; routing it through the thing that is down would
+        // make the lifeboat depend on the ship. `apps/api` learns about the use
+        // afterwards, from T3.6's local audit.
+        //
+        // It sits **after** the cache lookup on purpose: a capability is single
+        // use, and the client sends the same `PunchHoleRequest` up to three
+        // times. Without the cache in front, a peer slow to answer would burn
+        // the capability on attempt one and be refused as a replay on attempt
+        // two — the emergency path failing in exactly the conditions that
+        // produced the emergency.
+        if breakglass::looks_like(token) {
+            return match self.breakglass.decide(token, req.to_id, req.from_ip) {
+                Outcome::Allow(cap) => {
+                    let entry = CacheEntry {
+                        // A capability carries no permission limits; it is an
+                        // operator reaching a machine, and the api answers the
+                        // same way.
+                        permissions: None,
+                        // The nonce **is** the `conn_audit_ref`, exactly as
+                        // `authorize.ts` does it: unique, single-use, and
+                        // already travelling to the device. It is what makes a
+                        // break-glass session attributable — and therefore
+                        // revocable — like any other.
+                        conn_audit_ref: cap.nonce,
+                        breakglass: true,
+                        expires_at: Instant::now() + self.config.cache_ttl,
+                    };
+                    let decision = entry.decision(DecisionSource::Breakglass, started.elapsed());
+                    self.remember(key, entry);
+                    decision
+                }
+                Outcome::Refuse(reason) => {
+                    AuthDecision::deny(&reason, DecisionSource::Breakglass, started.elapsed())
+                }
+            };
         }
 
         match self.ask(req, token).await {
@@ -555,13 +632,6 @@ impl Authorizer {
                     expires_at: Instant::now() + self.config.cache_ttl,
                 };
                 let decision = entry.decision(DecisionSource::Api, started.elapsed());
-                // Break-glass allows are cached like any other, and that is
-                // deliberate. The capability is single-use at the api server,
-                // which means the client's second punch attempt would be
-                // refused as a replay and `bail!` the whole connect — the
-                // emergency path would fail exactly when the peer is slow. The
-                // nonce is still spent once; the cache only replays the same
-                // answer to the same retry inside the same few seconds.
                 self.remember(key, entry);
                 decision
             }
@@ -885,6 +955,7 @@ mod tests {
 #[cfg(test)]
 mod api_tests {
     use super::*;
+    use sodiumoxide::crypto::sign;
     use hbb_common::tokio::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1136,25 +1207,124 @@ mod api_tests {
         assert_eq!(after.conn_audit_ref, "ref-two");
     }
 
+    /// Since T3.5 the emergency path is decided **here**, with no api call.
+    ///
+    /// This test asserted the opposite before that — it stubbed the api
+    /// answering `{"breakglass":true}` — which only worked because hbbs was
+    /// forwarding capabilities to the very server the emergency is usually
+    /// about.
+    fn armed() -> (BreakglassConfig, sign::SecretKey) {
+        sodiumoxide::init().ok();
+        let (pk, sk) = sign::gen_keypair();
+        (
+            BreakglassConfig {
+                pubkey: Some(pk),
+                ..Default::default()
+            },
+            sk,
+        )
+    }
+
+    fn capability(sk: &sign::SecretKey, device: &str, nonce: &str) -> String {
+        crate::breakglass::mint_for_test(
+            sk,
+            "alice",
+            device,
+            crate::common::now() as i64 + 600,
+            nonce,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_break_glass_capability_never_reaches_the_api() {
+        // The whole point of D1's escape hatch: it must work while the api is
+        // down, so it must not consult it even when it is up.
+        let stub = stub(vec![Reply::Http(200, r#"{"allow":false,"reason":"no"}"#)]).await;
+        let (bg, sk) = armed();
+        let auth = Authorizer::new_with(config_for(stub.addr), bg).unwrap();
+
+        let decision = auth
+            .authorize(&req(&capability(&sk, "123456789", "nonce-1"), "123456789", "DEFAULT_CONN"))
+            .await;
+
+        assert!(decision.allow);
+        assert!(decision.breakglass);
+        assert_eq!(decision.source, DecisionSource::Breakglass);
+        // The nonce doubles as the audit ref, which is what makes the session
+        // attributable and therefore revocable (`authorize.ts` agrees).
+        assert_eq!(decision.conn_audit_ref, "nonce-1");
+        assert_eq!(stub.calls(), 0, "the emergency path asked the api");
+    }
+
     #[tokio::test]
     async fn a_break_glass_allow_is_cached_so_the_retry_is_not_a_replay() {
-        // The capability is single-use at the api server. If the second punch
-        // attempt reached it, it would come back "already used" and `bail!` the
-        // whole connect — the emergency path failing whenever the peer is slow.
-        let stub = stub(vec![
-            Reply::Http(200, r#"{"allow":true,"breakglass":true,"conn_audit_ref":"nonce-1"}"#),
-            Reply::Http(200, r#"{"allow":false,"reason":"This emergency access code has already been used."}"#),
-        ])
-        .await;
-        let auth = Authorizer::new(config_for(stub.addr)).unwrap();
+        // A capability is single use. The client sends the same
+        // `PunchHoleRequest` up to three times, so without the cache in front
+        // the second attempt would be refused as a replay and `bail!` the whole
+        // connect — the emergency path failing whenever the peer is slow.
+        let stub = stub(vec![]).await;
+        let (bg, sk) = armed();
+        let auth = Authorizer::new_with(config_for(stub.addr), bg).unwrap();
+        let token = capability(&sk, "123456789", "nonce-2");
 
-        let first = auth.authorize(&req("bg.aaa.bbb", "123456789", "DEFAULT_CONN")).await;
-        let retry = auth.authorize(&req("bg.aaa.bbb", "123456789", "DEFAULT_CONN")).await;
+        let first = auth.authorize(&req(&token, "123456789", "DEFAULT_CONN")).await;
+        let retry = auth.authorize(&req(&token, "123456789", "DEFAULT_CONN")).await;
 
-        assert!(first.breakglass);
+        assert!(first.allow && first.breakglass);
         assert!(retry.allow, "the retry must not be refused as a replay");
         assert!(retry.breakglass);
-        assert_eq!(stub.calls(), 1);
+        assert_eq!(retry.conn_audit_ref, "nonce-2", "the retry must reuse the one ref");
+        assert_eq!(stub.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_capability_refused_here_is_not_forwarded_to_the_api_as_a_login_token() {
+        // Otherwise an operator who mistyped what they pasted is told their
+        // session expired, which sends them to fix the wrong thing.
+        let stub = stub(vec![Reply::Http(200, r#"{"allow":true}"#)]).await;
+        let (bg, _) = armed();
+        let auth = Authorizer::new_with(config_for(stub.addr), bg).unwrap();
+
+        let decision = auth.authorize(&req("bg.garbage", "123456789", "DEFAULT_CONN")).await;
+
+        assert!(!decision.allow);
+        assert_eq!(decision.source, DecisionSource::Breakglass);
+        assert_eq!(stub.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_capability_authorizes_while_the_api_is_unreachable() {
+        // D1's whole reason for existing, as one assertion.
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let (bg, sk) = armed();
+        let auth = Authorizer::new_with(config_for(addr), bg).unwrap();
+
+        let decision = auth
+            .authorize(&req(&capability(&sk, "123456789", "nonce-3"), "123456789", "DEFAULT_CONN"))
+            .await;
+        assert!(decision.allow && decision.breakglass);
+
+        // …and an ordinary user stays denied throughout.
+        let ordinary = auth.authorize(&req("tok", "123456789", "DEFAULT_CONN")).await;
+        assert!(!ordinary.allow);
+        assert_eq!(ordinary.source, DecisionSource::FailedClosed);
+    }
+
+    #[tokio::test]
+    async fn with_break_glass_disarmed_a_capability_is_refused_not_forwarded() {
+        let stub = stub(vec![Reply::Http(200, r#"{"allow":true}"#)]).await;
+        let (_, sk) = armed();
+        let auth = Authorizer::new_with(config_for(stub.addr), BreakglassConfig::default()).unwrap();
+
+        let decision = auth
+            .authorize(&req(&capability(&sk, "123456789", "nonce-4"), "123456789", "DEFAULT_CONN"))
+            .await;
+
+        assert!(!decision.allow);
+        assert_eq!(stub.calls(), 0);
+        assert!(!auth.breakglass_armed());
     }
 
     #[tokio::test]

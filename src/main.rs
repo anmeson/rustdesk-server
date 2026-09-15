@@ -31,7 +31,10 @@ fn main() -> ResultType<()> {
         , --auth-timeout-ms=[NUMBER(default=300)] 'How long to wait for an authorization decision'
         , --auth-cache-ttl-ms=[NUMBER(default=5000)] 'How long a positive decision may be reused'
         , --broker-verify=[Y/N(default=Y)] 'Require a punch/relay response to come from the peer hbbs actually brokered'
-        , --broker-strict-ip=[Y/N(default=N)] 'Also require that response to arrive from the registered IP of that peer. Breaks dual-stack and CGNAT peers'",
+        , --broker-strict-ip=[Y/N(default=N)] 'Also require that response to arrive from the registered IP of that peer. Breaks dual-stack and CGNAT peers'
+        , --breakglass-pubkey=[BASE64] 'Ed25519 public key that signs break-glass capabilities. Setting it arms the emergency path'
+        , --breakglass-max-ttl-sec=[NUMBER(default=14400)] 'Refuse a capability valid for longer than this'
+        , --breakglass-rate-per-minute=[NUMBER(default=10)] 'Break-glass verification attempts allowed per source IP per minute'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
     // Read and validated before anything binds a port. A misconfiguration here
