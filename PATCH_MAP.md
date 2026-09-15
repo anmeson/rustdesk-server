@@ -117,9 +117,35 @@ cannot identify a session, so `hbbs` is the sole enforcement point
 | S38 | applied 2026-09-15 (T5.3) | `tests/t53_revocation.rs` (new), `tests/harness/session.rs` (new) | revocation end to end: the next connection refused in the user's own words, a live **direct** session ended by a revoke, a relayed one too, a grant expiring mid-session with no operator at all, and the two that must **not** die — another user's session, and an owner's when a redundant grant is tidied away | decision D2 is the claim that revoking access ends the session it was authorizing, and every plausible wrong design passes a test that only checks the next connection. The direct case is tested first because a relay-side kill — the obvious wrong design — would miss it entirely | Isolated | low — test-only |
 | S39 | applied 2026-09-15 (T5.4) | `tests/t54_breakglass.rs` (new), `tests/harness/breakglass.rs` (new), `tests/harness/api.rs` (`kill_now`, `restart`) | break-glass through the outage it exists for: capabilities minted by the **real** `keygen`/`mint` scripts, the api killed with SIGKILL, the local audit record on disk during the outage with its cursor unmoved, and reconciliation to the console once the api returns on the same port | S22 proves the verifier against a stub; nothing proved that the two commands an operator runs at three in the morning produce something these servers accept, or that a record written during an outage ever arrives. Both are failures you would discover only during the next outage | Isolated | low — test-only |
 | S40 | applied 2026-09-15 (T5.5) | `tests/t55_unenrolled.rs` (new), `tests/harness/api.rs` (`requests_to`), `tests/harness/world.rs` (`enrol_cache_ttl_ms`) | the unenrolled device against the real api: `NOT_DEPLOYED` reaching the client, the id staying unclaimed, twelve rapid retries producing ≤ 2 api calls, eight heartbeats producing none, and a device disabled in the console taking itself offline | registration is a UDP keepalive loop, so a mistake here is a retry storm rather than an error anybody reads — and the only honest way to test "does not storm the api" is to count what **arrived**, from the api's own log, not what hbbs believes it rate-limited | Isolated | low — test-only |
-
+| S41 | applied 2026-09-15 (T5.6) | `tests/t56_failure_injection.rs` (new), `tests/harness/fault.rs` (new), `tests/harness/world.rs` (`fault_injection`), `tests/harness/mod.rs` (`register` docstring) | failure injection on the api path: the api killed outright, a fault proxy between hbbs and the api for the modes the api cannot produce, and ten of them swept for a single allow — plus the three separate claims behind "does not wedge" | D1 is the whole login layer, and an outage is the one condition under which a mistake here costs everything rather than one connection. Two of the three faults the task names — slow, garbage — cannot be produced by `apps/api` without shipping a fault mode in the product, so they go in the wire; and the proxy carries **only** hbbs, so the console stays readable while hbbs can get no answer at all | Isolated | low — test-only |
 
 ### Notes on the `S` rows
+
+**S41's slow case forwards to the api rather than sleeping in front of it.**
+That is the difference between testing a timeout and testing nothing: the api
+receives the request, decides **allow**, writes its audit row, and answers late —
+and hbbs denies anyway. Fail-closed is hbbs's decision, taken against the api's
+own conclusion, and only a proxy that actually forwards can say so. The same
+design is why `Fault::Blackhole` holds the socket open instead of closing it;
+closing it is `Fault::Hangup`, a connection error in microseconds, and a
+different thing entirely.
+
+**S41 measures "hbbs does not wedge" as three claims, not one.** A denial costs
+the timeout and no more; four connections onto a dead api are refused in one
+timeout between them rather than four in a row; and hbbs recovers with nobody
+restarting anything. The middle one is the load-bearing claim — authorization
+runs only on the TCP path, which spawns per connection, and a future check moved
+onto the inline UDP arm would take the fleet down one datagram at a time. It is
+also the one a refactor can break silently.
+
+**S41 needs `RegisterPeer` keepalives and that is not a harness detail.** The
+`OFFLINE` check (`REG_TIMEOUT`, 30 s) runs *before* authorization, so any suite
+that spends longer than that refusing connections starts getting `OFFLINE` — a
+true answer to a different question, and one that would let the sweep pass
+without reaching the gate under test. `update_pk` is the only thing that
+refreshes `last_reg_time` and it is skipped when nothing changed
+(`rendezvous_server.rs:603`), so a repeated `RegisterPk` refreshes nothing.
+`RegisterPeer` is the keepalive and the only one.
 
 **S40's storm assertions count requests at the api, not at hbbs.** Three
 mechanisms stand between a registering fleet and `apps/api` — the verdict cache

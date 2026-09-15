@@ -29,6 +29,7 @@ use hbb_common::tokio::time::sleep;
 
 use super::{
     api::{api_with, Api, ClientApi, Console, SHARED_SECRET},
+    fault::FaultProxy,
     hbbs_full,
     peer::{next_device_id, Brokerage, Controller, Device},
     relay::{hbbr_on, Hbbr},
@@ -44,6 +45,9 @@ pub struct World {
     // produces a fail-closed denial in the log of a test that already passed.
     pub hbbs: Hbbs,
     pub hbbr: Hbbr,
+    /// Present only when the world was built with [`WorldBuilder::fault_injection`].
+    /// It sits between hbbs and the api and nowhere else — see `fault.rs`.
+    fault: Option<FaultProxy>,
     pub api: Api,
     pub console: Console,
     pub client: ClientApi,
@@ -61,6 +65,7 @@ pub struct WorldBuilder {
     breakglass: Option<String>,
     reconcile_sec: u64,
     enrol_cache_ttl_ms: Option<u64>,
+    fault_injection: bool,
 }
 
 impl Default for WorldBuilder {
@@ -79,6 +84,7 @@ impl Default for WorldBuilder {
             api_env: Vec::new(),
             breakglass: None,
             enrol_cache_ttl_ms: None,
+            fault_injection: false,
             // The 60 s production default is right for production and useless
             // here: reconciliation is the thing under test, not something to
             // wait a minute for.
@@ -161,6 +167,17 @@ impl WorldBuilder {
         self
     }
 
+    /// Puts a fault injector between hbbs and the api — T5.6.
+    ///
+    /// Off by default, and it changes nothing until a test sets a fault: a
+    /// healthy proxy forwards. It is a build-time option rather than something a
+    /// test can add later because hbbs is handed the auth URL at boot and never
+    /// re-reads it.
+    pub fn fault_injection(mut self, on: bool) -> Self {
+        self.fault_injection = on;
+        self
+    }
+
     /// How often hbbs replays unacknowledged audit records to the api.
     pub fn reconcile_sec(mut self, secs: u64) -> Self {
         self.reconcile_sec = secs;
@@ -181,9 +198,22 @@ impl WorldBuilder {
         }
         let api = api_with(&api_env).await;
 
+        // Between the api booting and hbbs booting, because hbbs takes the URL
+        // as an argument — and it must be the proxy's, or the fault would be
+        // injected into a path nobody uses.
+        let fault = if self.fault_injection {
+            Some(FaultProxy::in_front_of(api.port).await)
+        } else {
+            None
+        };
+        let auth_url = match &fault {
+            Some(proxy) => proxy.base(),
+            None => api.base(),
+        };
+
         let mut args = vec![
             "--auth-api-url".to_owned(),
-            api.base(),
+            auth_url,
             "--auth-api-secret".to_owned(),
             SHARED_SECRET.to_owned(),
             "--auth-timeout-ms".to_owned(),
@@ -230,7 +260,7 @@ impl WorldBuilder {
         let console = Console::login(&api).await;
         let client = ClientApi::new(&api);
 
-        World { hbbs, hbbr, api, console, client }
+        World { hbbs, hbbr, fault, api, console, client }
     }
 }
 
@@ -246,6 +276,13 @@ impl World {
 
     pub fn relay_addr(&self) -> String {
         self.hbbr.addr()
+    }
+
+    /// The fault injector, for a world built with `fault_injection(true)`.
+    pub fn fault(&self) -> &FaultProxy {
+        self.fault
+            .as_ref()
+            .expect("this world has no fault injector — build it with .fault_injection(true)")
     }
 
     /// A signed-in user on their own machine.

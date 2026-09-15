@@ -26,6 +26,7 @@
 
 pub mod api;
 pub mod breakglass;
+pub mod fault;
 pub mod peer;
 pub mod relay;
 pub mod session;
@@ -462,8 +463,15 @@ pub async fn hbbs_expect_exit(extra: &[String]) -> String {
 /// socket is silently dropped, and an unregistered peer fails the `ID_NOT_EXIST`
 /// branch *before* the authorization check — so a lost datagram here does not
 /// look like a lost datagram, it looks like this whole task not working.
-/// `RegisterPk` is enough on its own: `PeerMap::update_pk` sets `last_reg_time`
-/// (`src/peer.rs:108`), which is what the `OFFLINE` check reads.
+/// `RegisterPk` is enough to get *registered*: `PeerMap::update_pk` sets
+/// `last_reg_time` (`src/peer.rs:108`), which is what the `OFFLINE` check reads.
+///
+/// **It is not enough to stay registered.** `update_pk` is skipped when nothing
+/// about the registration changed (`rendezvous_server.rs:603`), so a second
+/// `RegisterPk` from the same device refreshes nothing and is still answered
+/// `OK`. A test that runs longer than `REG_TIMEOUT` (30 s) has to send
+/// `RegisterPeer` — `harness::register_peer_on` — exactly as a settled client
+/// does. T5.6 found this the expensive way.
 pub async fn register(port: u16, id: &str) -> FramedSocket {
     let mut sock = FramedSocket::new("127.0.0.1:0".parse::<SocketAddr>().unwrap())
         .await
