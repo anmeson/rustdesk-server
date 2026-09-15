@@ -23,9 +23,21 @@ fn main() -> ResultType<()> {
         -r, --relay-servers=[HOST] 'Sets the default relay servers, separated by comma'
         -M, --rmem=[NUMBER(default={RMEM})] 'Sets UDP recv buffer size, set system rmem_max first, e.g., sudo sysctl -w net.core.rmem_max=52428800. vi /etc/sysctl.conf, net.core.rmem_max=52428800, sudo sysctl –p'
         , --mask=[MASK] '[DEPRECATED] Determine if the connection comes from LAN, e.g. 192.168.0.0/16'
-        -k, --key=[KEY] 'Only allow the client with the same key'",
+        -k, --key=[KEY] 'Only allow the client with the same key'
+        , --auth-api-url=[URL] 'Base URL of the auth API. Setting it turns connection authorization on'
+        , --auth-api-secret=[SECRET] 'Shared secret sent as x-hbbs-secret. Must differ from --key'
+        , --auth-required=[Y/N] 'Force authorization on or off (default: on when --auth-api-url is set)'
+        , --auth-fail-open=[Y/N(default=N)] 'UNSUPPORTED. Broker connections when the auth API is unreachable'
+        , --auth-timeout-ms=[NUMBER(default=300)] 'How long to wait for an authorization decision'
+        , --auth-cache-ttl-ms=[NUMBER(default=5000)] 'How long a positive decision may be reused'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
+    // Read and validated before anything binds a port. A misconfiguration here
+    // would otherwise surface as a fleet that cannot connect, with the reason
+    // visible only per-connection — so it is a boot-time refusal instead
+    // (T3.1, decision D1).
+    let auth_config = auth::AuthConfig::from_args()?;
+    auth_config.log();
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
     if port < 3 {
         bail!("Invalid port");
