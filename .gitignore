@@ -10,3 +10,9 @@ src/version.rs
 db_v2.sqlite3
 test.*
 .idea
+
+# Written by `hbbs` at runtime when BREAKGLASS_AUDIT_LOG keeps its relative
+# default (T3.6). Never source; one was committed by a test that took that
+# default, which is what this line is for.
+breakglass-audit.log
+breakglass-audit.log.cursor

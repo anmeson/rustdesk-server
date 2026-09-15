@@ -1448,6 +1448,22 @@ mod api_tests {
         (
             BreakglassConfig {
                 pubkey: Some(pk),
+                // **Not the default.** `BREAKGLASS_AUDIT_LOG` defaults to a
+                // *relative* path, so a test taking it would write a real
+                // emergency-access audit into the source tree — which is how
+                // one got committed once.
+                audit_log: {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static NEXT: AtomicUsize = AtomicUsize::new(0);
+                    let mut path = std::env::temp_dir();
+                    path.push(format!(
+                        "auth-bg-{}-{}.log",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::SeqCst)
+                    ));
+                    let _ = std::fs::remove_file(&path);
+                    path
+                },
                 ..Default::default()
             },
             sk,
