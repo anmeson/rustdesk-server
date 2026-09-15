@@ -24,6 +24,7 @@
 //! are written around it.
 
 use std::{
+    net::SocketAddr,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -50,6 +51,9 @@ pub struct Api {
     child: Child,
     pub port: u16,
     pub db: String,
+    /// Kept so a restart comes back configured the way it started.
+    env: Vec<(String, String)>,
+    ready_lines: usize,
     _dir: TempDir,
 }
 
@@ -60,6 +64,64 @@ impl Api {
 
     pub fn log(&self) -> String {
         std::fs::read_to_string(self._dir.path().join("api.log")).unwrap_or_default()
+    }
+
+    fn ready_count(&self) -> usize {
+        self.log().matches(READY).count()
+    }
+
+    /// **Kills the api outright, leaving its database intact.**
+    ///
+    /// SIGKILL, and that is the point twice over. It is the honest shape of the
+    /// outage break-glass exists for — a host that went away, not a service that
+    /// was asked politely to stop — and it skips the SIGTERM handler that drops
+    /// the database, so the world that comes back is the world that went down.
+    pub fn kill_now(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Brings it back **on the same port, with the same database**.
+    ///
+    /// The port matters: hbbs is given the api's address at boot and never
+    /// re-reads it, so an api that returns somewhere else is, to hbbs, an outage
+    /// that never ended.
+    pub async fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let extra: Vec<(&str, String)> =
+            self.env.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let want = self.ready_count() + 1;
+        self.child = command_for(
+            &repo_root(),
+            self._dir.path(),
+            self.port,
+            &self.db,
+            &extra,
+            true,
+        )
+        .spawn()
+        .expect("could not respawn node");
+        for _ in 0..600 {
+            if self.ready_count() >= want {
+                self.ready_lines = want;
+                return;
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!("apps/api exited on restart: {status}\n{}", self.log());
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("apps/api never came back on {}\n{}", self.port, self.log());
+    }
+
+    /// True while nothing is listening — what hbbs sees during the outage.
+    pub fn is_down(&self) -> bool {
+        std::net::TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], self.port)),
+            Duration::from_millis(200),
+        )
+        .is_err()
     }
 }
 
@@ -106,62 +168,47 @@ fn repo_root() -> std::path::PathBuf {
 /// `extra_env` overrides anything below it — `BREAKGLASS_PUBKEY` for T5.4, and
 /// `CLIENT_TOKEN_TTL_SECONDS` for the token-expiry cases in T5.9.
 pub async fn api_with(extra_env: &[(&str, String)]) -> Api {
-    let root = repo_root();
-    let dir = TempDir::new();
     let port = free_port_block();
     // Per world, and dropped at both ends of its life (see e2e-server.ts). The
     // `_test` suffix is not decoration: the server refuses to start without it,
     // because it drops whatever it is pointed at.
     let db = format!("anmesondesk_e2e_{}_{}_test", std::process::id(), port);
+    spawn_api(port, db, TempDir::new(), extra_env, false).await
+}
 
-    let log = dir.path().join("api.log");
-    let mut cmd = Command::new("node");
-    cmd.current_dir(root.join("apps/api"))
-        // `env_clear` for the same reason hbbs gets it: a stray MONGODB_DB or
-        // PORT in the developer's shell would otherwise point a test at the
-        // fleet's own database.
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .env("NODE_ENV", "production")
-        .env("PORT", port.to_string())
-        .env("HOST", "127.0.0.1")
-        .env("MONGODB_URI", "mongodb://localhost:27017")
-        .env("MONGODB_DB", &db)
-        .env("PUBLIC_URL", format!("http://127.0.0.1:{port}"))
-        .env("ADMIN_ORIGINS", format!("http://127.0.0.1:{port}"))
-        .env("BETTER_AUTH_SECRET", "e2e-only-better-auth-secret-not-for-real-use")
-        .env("HBBS_SHARED_SECRET", SHARED_SECRET)
-        .env("E2E_ADMIN_EMAIL", ADMIN_EMAIL)
-        .env("E2E_ADMIN_PASSWORD", ADMIN_PASSWORD)
-        .env(
-            "BREAKGLASS_AUDIT_LOG",
-            dir.path().join("api-breakglass.log").display().to_string(),
-        )
-        .args(["--import", "tsx", "src/scripts/e2e-server.ts"])
-        .stdout(Stdio::from(std::fs::File::create(&log).unwrap()))
-        .stderr(Stdio::from(
-            std::fs::File::options().append(true).open(&log).unwrap(),
-        ));
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
+async fn spawn_api(
+    port: u16,
+    db: String,
+    dir: TempDir,
+    extra_env: &[(&str, String)],
+    reuse_db: bool,
+) -> Api {
+    let root = repo_root();
 
     // Built before anything below can panic, so a failed wait still reaps the
     // process and drops the database.
     let mut api = Api {
-        child: cmd.spawn().expect("could not spawn node — is it on PATH?"),
+        child: command_for(&root, dir.path(), port, &db, extra_env, reuse_db)
+            .spawn()
+            .expect("could not spawn node — is it on PATH?"),
         port,
         db,
+        env: extra_env.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+        ready_lines: 0,
         _dir: dir,
     };
+    // A restart appends to the same log, so "ready" has to mean *this* boot's
+    // line and not the previous one — counting them is the cheapest way to say
+    // that without parsing timestamps.
+    let want = api.ready_count() + 1;
 
     // The ready line is printed after `listen` resolves, so it means the port is
     // accepting *and* the admin exists. A `/health` poll would only prove the
     // first, and a console sign-in racing the seed is a 401 that looks like a
     // broken guard.
     for _ in 0..600 {
-        if api.log().contains(READY) {
+        if api.ready_count() >= want {
+            api.ready_lines = want;
             return api;
         }
         if let Ok(Some(status)) = api.child.try_wait() {
@@ -178,6 +225,54 @@ pub async fn api_with(extra_env: &[(&str, String)]) -> Api {
         api.port,
         api.log()
     );
+}
+
+/// The exact invocation, in one place, so a restart cannot drift from a boot.
+fn command_for(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    port: u16,
+    db: &str,
+    extra_env: &[(&str, String)],
+    reuse_db: bool,
+) -> Command {
+    let log = dir.join("api.log");
+    let mut cmd = Command::new("node");
+    cmd.current_dir(root.join("apps/api"))
+        // `env_clear` for the same reason hbbs gets it: a stray MONGODB_DB or
+        // PORT in the developer's shell would otherwise point a test at the
+        // fleet's own database.
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("NODE_ENV", "production")
+        .env("PORT", port.to_string())
+        .env("HOST", "127.0.0.1")
+        .env("MONGODB_URI", "mongodb://localhost:27017")
+        .env("MONGODB_DB", db)
+        .env("PUBLIC_URL", format!("http://127.0.0.1:{port}"))
+        .env("ADMIN_ORIGINS", format!("http://127.0.0.1:{port}"))
+        .env("BETTER_AUTH_SECRET", "e2e-only-better-auth-secret-not-for-real-use")
+        .env("HBBS_SHARED_SECRET", SHARED_SECRET)
+        .env("E2E_ADMIN_EMAIL", ADMIN_EMAIL)
+        .env("E2E_ADMIN_PASSWORD", ADMIN_PASSWORD)
+        .env("BREAKGLASS_AUDIT_LOG", dir.join("api-breakglass.log").display().to_string())
+        .args(["--import", "tsx", "src/scripts/e2e-server.ts"])
+        // Appended, not truncated: a restart must not throw away the log of the
+        // run that preceded the outage.
+        .stdout(Stdio::from(
+            std::fs::File::options().create(true).append(true).open(&log).unwrap(),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::options().create(true).append(true).open(&log).unwrap(),
+        ));
+    if reuse_db {
+        cmd.env("E2E_REUSE_DB", "1");
+    }
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd
 }
 
 pub async fn api() -> Api {

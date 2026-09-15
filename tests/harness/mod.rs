@@ -25,6 +25,7 @@
 #![allow(dead_code)]
 
 pub mod api;
+pub mod breakglass;
 pub mod peer;
 pub mod relay;
 pub mod session;

@@ -58,6 +58,8 @@ pub struct WorldBuilder {
     hbbs_args: Vec<String>,
     hbbs_env: Vec<(String, String)>,
     api_env: Vec<(String, String)>,
+    breakglass: Option<String>,
+    reconcile_sec: u64,
 }
 
 impl Default for WorldBuilder {
@@ -74,6 +76,11 @@ impl Default for WorldBuilder {
             hbbs_args: Vec::new(),
             hbbs_env: Vec::new(),
             api_env: Vec::new(),
+            breakglass: None,
+            // The 60 s production default is right for production and useless
+            // here: reconciliation is the thing under test, not something to
+            // wait a minute for.
+            reconcile_sec: 1,
         }
     }
 }
@@ -126,15 +133,38 @@ impl WorldBuilder {
         self
     }
 
+    /// Arms the emergency path on **both** servers with one public key.
+    ///
+    /// Both, because they do different halves of the same job and a world with
+    /// only one armed would quietly test neither: hbbs verifies the capability
+    /// locally — that is the point, it works when the api does not — and the api
+    /// verifies it again on the ordinary path *and* is the thing hbbs eventually
+    /// reconciles its local audit records to. Unset on either side means every
+    /// capability is refused there (`breakglass.rs`, `env.ts`), which ships as
+    /// the default on purpose.
+    pub fn breakglass(mut self, pubkey: &str) -> Self {
+        self.breakglass = Some(pubkey.to_owned());
+        self
+    }
+
+    /// How often hbbs replays unacknowledged audit records to the api.
+    pub fn reconcile_sec(mut self, secs: u64) -> Self {
+        self.reconcile_sec = secs;
+        self
+    }
+
     pub async fn up(self) -> World {
         let relay_port = free_port_block();
         let relay_addr = format!("127.0.0.1:{relay_port}");
 
-        let api_env: Vec<(&str, String)> = self
+        let mut api_env: Vec<(&str, String)> = self
             .api_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
+        if let Some(pubkey) = &self.breakglass {
+            api_env.push(("BREAKGLASS_PUBKEY", pubkey.clone()));
+        }
         let api = api_with(&api_env).await;
 
         let mut args = vec![
@@ -154,6 +184,15 @@ impl WorldBuilder {
         if self.enrol_required {
             args.push("--enrol-required".to_owned());
             args.push("Y".to_owned());
+        }
+        if let Some(pubkey) = &self.breakglass {
+            args.push("--breakglass-pubkey".to_owned());
+            args.push(pubkey.clone());
+            args.push("--breakglass-reconcile-sec".to_owned());
+            args.push(self.reconcile_sec.to_string());
+            // The audit log path is left at its default, `./breakglass-audit.log`,
+            // which lands in hbbs's working directory — so `hbbs.dir()` finds it
+            // and the default is what gets exercised.
         }
         args.extend(self.hbbs_args);
 
