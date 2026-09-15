@@ -264,7 +264,15 @@ async fn an_admin_is_refused_until_they_grant_themselves_access() {
 /// the job it was added for rather than merely existing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_punch_that_falls_back_to_a_relay_is_one_decision_and_one_row() {
-    let w = World::up().await;
+    // **The window is configured, not assumed.** The property is "a fallback
+    // *inside* the decision cache's window is one decision", and a real client's
+    // fallback follows its punch by seconds — well inside the 5 s default. On a
+    // loaded machine this test's two connects can drift past it, at which point
+    // the relay is legitimately a second decision with a second ref and a second
+    // row, and the test fails for a reason that has nothing to do with the code.
+    // Setting the TTL puts the window under the test's control instead of the
+    // scheduler's.
+    let w = World::builder().auth_cache_ttl_ms(30_000).up().await;
     let alice = w.controller("alice").await;
     let mut laptop = w.device(&alice).await;
 

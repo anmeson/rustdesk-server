@@ -60,6 +60,7 @@ pub struct WorldBuilder {
     api_env: Vec<(String, String)>,
     breakglass: Option<String>,
     reconcile_sec: u64,
+    enrol_cache_ttl_ms: Option<u64>,
 }
 
 impl Default for WorldBuilder {
@@ -77,6 +78,7 @@ impl Default for WorldBuilder {
             hbbs_env: Vec::new(),
             api_env: Vec::new(),
             breakglass: None,
+            enrol_cache_ttl_ms: None,
             // The 60 s production default is right for production and useless
             // here: reconciliation is the thing under test, not something to
             // wait a minute for.
@@ -89,6 +91,18 @@ impl WorldBuilder {
     /// Registration ownership (Milestone 3.5). Off by default, as it ships.
     pub fn enrol_required(mut self, on: bool) -> Self {
         self.enrol_required = on;
+        self
+    }
+
+    /// How long an enrolment verdict is used before hbbs re-checks it.
+    ///
+    /// Ten minutes in production, which is right — the question "is this device
+    /// one of ours" is durable, and the cache is what stops every registration
+    /// in the fleet becoming an api call. A test that wants to watch a verdict
+    /// *change* has to turn it down, and one that wants to watch it **hold** has
+    /// to leave it up.
+    pub fn enrol_cache_ttl_ms(mut self, ms: u64) -> Self {
+        self.enrol_cache_ttl_ms = Some(ms);
         self
     }
 
@@ -184,6 +198,10 @@ impl WorldBuilder {
         if self.enrol_required {
             args.push("--enrol-required".to_owned());
             args.push("Y".to_owned());
+        }
+        if let Some(ms) = self.enrol_cache_ttl_ms {
+            args.push("--enrol-cache-ttl-ms".to_owned());
+            args.push(ms.to_string());
         }
         if let Some(pubkey) = &self.breakglass {
             args.push("--breakglass-pubkey".to_owned());

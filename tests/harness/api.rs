@@ -70,6 +70,18 @@ impl Api {
         self.log().matches(READY).count()
     }
 
+    /// How many requests this api has answered on `path`.
+    ///
+    /// Counted from the server's own request log rather than from anything hbbs
+    /// reports, because the question T5.5 asks — "does an unenrolled device storm
+    /// the api" — is about what actually *arrived*. hbbs's own counters would
+    /// only prove hbbs believes it rate-limited itself.
+    ///
+    /// Fastify logs one `"url":"…"` line per incoming request at `NODE_ENV=production`.
+    pub fn requests_to(&self, path: &str) -> usize {
+        self.log().matches(&format!("\"url\":\"{path}\"")).count()
+    }
+
     /// **Kills the api outright, leaving its database intact.**
     ///
     /// SIGKILL, and that is the point twice over. It is the honest shape of the

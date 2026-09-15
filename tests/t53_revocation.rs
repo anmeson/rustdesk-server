@@ -109,7 +109,10 @@ async fn a_revoked_user_is_refused_the_next_connection_in_the_right_words() {
 /// — and that distinction is the one worth being explicit about.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_decision_cache_delays_a_revocation_and_then_stops_it() {
-    let ttl = 2_000;
+    // Long enough that the revoke-then-connect below is inside the window even
+    // on a loaded machine — the subject is the cache, so the test must not be
+    // racing it — and short enough that waiting it out does not pad the run.
+    let ttl = 10_000;
     let w = World::builder().auth_cache_ttl_ms(ttl).up().await;
     let alice = w.controller("alice").await;
     let bob = w.controller("bob").await;
