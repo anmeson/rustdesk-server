@@ -52,6 +52,7 @@ fn main() -> ResultType<()> {
         serial,
         &get_arg_or("key", "-".to_owned()),
         rmem,
+        auth_config,
     )?;
     Ok(())
 }

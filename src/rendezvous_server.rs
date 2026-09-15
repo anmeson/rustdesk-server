@@ -1,3 +1,4 @@
+use crate::auth::{self, AuthRequest, Authorizer};
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
@@ -88,6 +89,10 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
+    /// The connection-authorization decision maker (T3.2). Built once for the
+    /// process, and shared rather than cloned: it owns the HTTP connection pool
+    /// to `apps/api` and the decision cache, both of which are worthless per-clone.
+    authorizer: Arc<Authorizer>,
 }
 
 enum LoopFailure {
@@ -99,8 +104,14 @@ enum LoopFailure {
 }
 
 impl RendezvousServer {
-    pub fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
-        Self::start_with_bind(None, port, serial, key, rmem)
+    pub fn start(
+        port: i32,
+        serial: i32,
+        key: &str,
+        rmem: usize,
+        auth_config: auth::AuthConfig,
+    ) -> ResultType<()> {
+        Self::start_with_bind(None, port, serial, key, rmem, auth_config)
     }
 
     #[tokio::main(flavor = "multi_thread")]
@@ -110,7 +121,12 @@ impl RendezvousServer {
         serial: i32,
         key: &str,
         rmem: usize,
+        auth_config: auth::AuthConfig,
     ) -> ResultType<()> {
+        // Inside the tokio runtime (`#[tokio::main]` above) and before any port
+        // is bound, which is what `Authorizer::new` asks for: it builds the
+        // reqwest client the whole process then shares.
+        let authorizer = Arc::new(Authorizer::new(auth_config)?);
         let (key, sk) = Self::get_server_sk(key);
         let nat_port = port - 1;
         let ws_port = port + 2;
@@ -142,6 +158,7 @@ impl RendezvousServer {
             relay_servers: Default::default(),
             relay_servers0: Default::default(),
             rendezvous_servers: Arc::new(rendezvous_servers),
+            authorizer,
             inner: Arc::new(Inner {
                 serial,
                 version,
@@ -737,6 +754,81 @@ impl RendezvousServer {
                 return Ok((msg_out, None));
             }
             
+            // Authorization (T3.3). Placed after the licence-key, peer-exists and
+            // OFFLINE checks because those are free and this one costs an HTTP
+            // request that a human is waiting on — nothing that was going to be
+            // refused anyway should spend one. Placed *before* the PUNCH_REQS ring
+            // below because that ring is an unbounded operator log of who was
+            // brokered to whom, and a stranger we refuse must not be able to grow
+            // it; refused attempts get their own record in T3.7.
+            let decision = self
+                .authorizer
+                .authorize(&AuthRequest {
+                    token: &ph.token,
+                    // `PunchHoleRequest` carries no id for the caller
+                    // (`rendezvous.proto:20-32`), so hbbs cannot fill this in.
+                    from_id: "",
+                    to_id: &id,
+                    conn_type: auth::conn_type_name(ph.conn_type),
+                    from_ip: &try_into_v4(addr).ip().to_string(),
+                })
+                .await;
+            if !decision.allow {
+                log::info!(
+                    "Authorization denied for peer {} from {} [{}]: {}",
+                    id,
+                    addr,
+                    decision.source.label(),
+                    decision.reason
+                );
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_punch_hole_response(PunchHoleResponse {
+                    // Not a `Failure` variant — the enum has no code for "not
+                    // permitted", and inventing one would need a proto change on
+                    // both sides. `other_failure` is read first and shown to the
+                    // user verbatim (`apps/rustdesk/src/client.rs:938-939`), and
+                    // leaving `failure` at its default is safe precisely because
+                    // the client only looks at it when `other_failure` is empty.
+                    other_failure: decision.reason,
+                    ..Default::default()
+                });
+                return Ok((msg_out, None));
+            }
+            if decision.breakglass {
+                log::warn!(
+                    "Break-glass capability authorized {} -> {} [{}]",
+                    addr,
+                    id,
+                    decision.source.label()
+                );
+            }
+            // The ref is the only thing tying the session the controlled device is
+            // about to open back to the user who asked for it: `/api/audit/conn`
+            // completes the decision row with the `conn_id`, and D2 revocation
+            // looks the session up by it. Dropping it here does not merely blur
+            // the audit trail, it makes the session unrevocable. Left unset when
+            // empty — with authorization off there is no ref, and the message then
+            // goes out byte-identical to upstream's.
+            let controlled_context = if decision.conn_audit_ref.is_empty() {
+                MessageField::none()
+            } else {
+                MessageField::some(ControlledContext {
+                    conn_audit_ref: decision.conn_audit_ref,
+                    ..Default::default()
+                })
+            };
+            // Two-bit tri-states, not a bitmask (`ControlPermissions` decoder at
+            // `apps/rustdesk/src/common.rs:2775-2791`): hbbs forwards the api's
+            // number unread. `None` means the grant set no limits, and an absent
+            // field is what the client reads as "leave it to the device".
+            let control_permissions = match decision.permissions {
+                Some(permissions) => MessageField::some(ControlPermissions {
+                    permissions: permissions as u64,
+                    ..Default::default()
+                }),
+                None => MessageField::none(),
+            };
+
             // record punch hole request (from addr -> peer id/peer_addr)
             {
                 let from_ip = try_into_v4(addr).ip().to_string();
@@ -783,6 +875,8 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    control_permissions,
+                    controlled_context,
                     ..Default::default()
                 });
             } else {
@@ -796,6 +890,8 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    control_permissions,
+                    controlled_context,
                     ..Default::default()
                 });
             }
