@@ -335,9 +335,17 @@ async fn a_relay_request_for_an_unknown_peer_is_silent_and_free() {
 //
 // `PunchHoleSent`, `LocalAddr` and `RelayResponse` are all routed on an address
 // the *sender* supplies, and upstream checks nothing about who sent them. So a
-// stranger who knows a waiting controller's address as hbbs sees it can answer
-// on the real peer's behalf. Both tests below were written against the running
-// binaries, not from reading the source.
+// stranger who knows a waiting controller's address as hbbs sees it could answer
+// on the real peer's behalf. Written against the running binaries, not from
+// reading the source.
+//
+// **T3.8 closes this**, with a ledger of who hbbs actually brokered to whom
+// (`src/broker.rs`). What these tests can reach is the *id* layer, which is the
+// one that ships on. The *ip* layer — `BROKER_STRICT_IP`, off by default — is
+// invisible from here for a structural reason: every party in this harness is
+// on 127.0.0.1, so a stranger and the real peer have the same address and no ip
+// check can tell them apart. It is unit-tested in `broker.rs` instead, and the
+// reason it does not ship on is written up there.
 
 /// A stranger's *words* must not reach a waiting user. This one is fixed
 /// (T3.3b): `refuse_reason` is the only attacker-reachable field that becomes
@@ -388,18 +396,20 @@ async fn a_stranger_cannot_put_text_on_a_waiting_users_screen() {
     }
 }
 
-/// **This test asserts a hole, not a fix — see T3.8.**
+/// The T3.8 fix, and the exact attack it was found by.
 ///
-/// The message still arrives; only its text was taken away above. A stranger
-/// can still answer a waiting controller with an address and relay server of
-/// their choosing, because nothing ties a response to the peer it claims to come
-/// from. Closing that needs hbbs to remember which pairs it brokered, which is a
-/// change to upstream's core routing and wants testing against real devices on a
-/// real network — so it is filed rather than guessed at here.
+/// A stranger answers a waiting controller naming an id hbbs has never heard
+/// of. That was the cheap and worst version of the attack: `get_pk` returns
+/// nothing for an unknown id, and the client treats an absent peer key as "no
+/// identity to verify" and connects anyway
+/// (`apps/rustdesk/src/client.rs:1624-1634`) — so the signature check that
+/// normally makes impersonation impossible was simply skipped, and the
+/// controller could be steered to an attacker while sending its connection
+/// password.
 ///
-/// Pinned so that closing it shows up as this test failing.
+/// This test asserted the hole until T3.8. It now asserts that A hears nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stranger_can_still_answer_a_waiting_controller() {
+async fn a_stranger_cannot_answer_a_waiting_controller() {
     let api = stub(200, ALLOW).await;
     let s = hbbs(&auth_args(&api)).await;
     let mut b = register(s.port, "t33-dev-16").await;
@@ -425,10 +435,243 @@ async fn a_stranger_can_still_answer_a_waiting_controller() {
     let mut msg = RendezvousMessage::new();
     msg.set_punch_hole_sent(PunchHoleSent {
         socket_addr: AddrMangle::encode(a_addr).into(),
-        // An id hbbs has never heard of, which is what makes this worse than a
-        // nuisance: `get_pk` returns nothing, and the client treats an absent
-        // peer key as "no identity to verify" and connects anyway
-        // (`apps/rustdesk/src/client.rs:1624-1634`).
+        id: "t33-not-a-device".to_owned(),
+        relay_server: "evil.example.com:21117".to_owned(),
+        version: "1.5.0".to_owned(),
+        ..Default::default()
+    });
+    evil.send(&msg).await.unwrap();
+
+    let heard = next_plaintext(&mut a, 2_500).await;
+    assert!(
+        heard.is_none(),
+        "a stranger answered for a peer hbbs never brokered: {heard:?}"
+    );
+}
+
+/// The other half, and the one that matters more than the fix: the real peer
+/// must still get through. A drop here is "nobody can connect".
+#[tokio::test(flavor = "multi_thread")]
+async fn the_brokered_peer_still_answers_its_waiting_controller() {
+    let api = stub(200, ALLOW).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-17").await;
+
+    let mut a = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let a_addr = a.local_addr();
+    let mut msg = RendezvousMessage::new();
+    msg.set_punch_hole_request(PunchHoleRequest {
+        id: "t33-dev-17".to_owned(),
+        licence_key: s.key.clone(),
+        token: "good-token".to_owned(),
+        ..Default::default()
+    });
+    a.send(&msg).await.unwrap();
+    let _ = next_from_hbbs(&mut b).await;
+
+    // The real device answers over a **new TCP connection**, which is the whole
+    // reason only an ip can ever be matched here and never a port
+    // (`rendezvous_mediator.rs:995`).
+    let mut peer = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let mut msg = RendezvousMessage::new();
+    msg.set_punch_hole_sent(PunchHoleSent {
+        socket_addr: AddrMangle::encode(a_addr).into(),
+        id: "t33-dev-17".to_owned(),
+        relay_server: format!("127.0.0.1:{}", s.port + 1),
+        version: "1.5.0".to_owned(),
+        ..Default::default()
+    });
+    peer.send(&msg).await.unwrap();
+
+    match next_plaintext(&mut a, 3_000)
+        .await
+        .expect("the brokered peer's answer was dropped")
+        .union
+    {
+        Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
+            assert_eq!(ph.relay_server, format!("127.0.0.1:{}", s.port + 1));
+            assert!(
+                !ph.pk.is_empty(),
+                "no peer key: the client would skip identity verification"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// `LocalAddr` is the same hole with a sharper edge — `la.local_addr` is copied
+/// straight into the response, so the sender picks the address A dials.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranger_cannot_answer_with_a_local_addr() {
+    let api = stub(200, ALLOW).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-18").await;
+
+    let mut a = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let a_addr = a.local_addr();
+    let mut msg = RendezvousMessage::new();
+    msg.set_punch_hole_request(PunchHoleRequest {
+        id: "t33-dev-18".to_owned(),
+        licence_key: s.key.clone(),
+        token: "good-token".to_owned(),
+        ..Default::default()
+    });
+    a.send(&msg).await.unwrap();
+    let _ = next_from_hbbs(&mut b).await;
+
+    let mut evil = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let mut msg = RendezvousMessage::new();
+    msg.set_local_addr(LocalAddr {
+        socket_addr: AddrMangle::encode(a_addr).into(),
+        local_addr: AddrMangle::encode("10.66.66.66:21118".parse::<std::net::SocketAddr>().unwrap())
+            .into(),
+        id: "t33-not-a-device".to_owned(),
+        version: "1.5.0".to_owned(),
+        ..Default::default()
+    });
+    evil.send(&msg).await.unwrap();
+
+    let heard = next_plaintext(&mut a, 2_500).await;
+    assert!(heard.is_none(), "a stranger chose the address A dials: {heard:?}");
+}
+
+/// A `RelayResponse` that names an id is B choosing the relay server
+/// (`create_relay(initiate = true)`), and A takes that server from the message.
+/// A stranger naming another id must not reach it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_response_naming_another_peer_is_dropped() {
+    let api = stub(200, ALLOW).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-19").await;
+
+    let mut a = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let a_addr = a.local_addr();
+    let mut msg = RendezvousMessage::new();
+    msg.set_request_relay(RequestRelay {
+        id: "t33-dev-19".to_owned(),
+        uuid: "t33-relay-uuid".to_owned(),
+        token: "good-token".to_owned(),
+        relay_server: "127.0.0.1:21117".to_owned(),
+        ..Default::default()
+    });
+    a.send(&msg).await.unwrap();
+    let _ = relay_at_b(&mut b).await;
+
+    let mut evil = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let mut rr = RelayResponse {
+        socket_addr: AddrMangle::encode(a_addr).into(),
+        uuid: "evil-uuid".to_owned(),
+        relay_server: "evil.example.com:21117".to_owned(),
+        version: "1.5.0".to_owned(),
+        ..Default::default()
+    };
+    rr.set_id("t33-not-a-device".to_owned());
+    let mut msg = RendezvousMessage::new();
+    msg.set_relay_response(rr);
+    evil.send(&msg).await.unwrap();
+
+    let heard = next_plaintext(&mut a, 2_500).await;
+    assert!(heard.is_none(), "a stranger chose A's relay server: {heard:?}");
+}
+
+/// The relay **fallback** ack carries no id at all — `create_relay` sends it
+/// with `initiate = false`, so no id, no uuid and no relay server
+/// (`rendezvous_mediator.rs:579-604`). Requiring an id would have broken every
+/// relayed session, so an absent one is accepted on the brokerage alone.
+///
+/// This is also the residual: on the fallback path the id layer has nothing to
+/// check, and only `BROKER_STRICT_IP` separates a stranger's ack from B's. It
+/// buys a stranger nothing beyond a race — A keeps its own uuid and relay
+/// server and learns only that somebody answered
+/// (`apps/rustdesk/src/client.rs:1750-1760`) — but it is a residual, not a fix.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_relay_fallback_ack_carries_no_id_and_still_reaches_the_controller() {
+    let api = stub(200, ALLOW).await;
+    let s = hbbs(&auth_args(&api)).await;
+    let mut b = register(s.port, "t33-dev-20").await;
+
+    let mut a = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let a_addr = a.local_addr();
+    let mut msg = RendezvousMessage::new();
+    msg.set_request_relay(RequestRelay {
+        id: "t33-dev-20".to_owned(),
+        uuid: "t33-relay-uuid".to_owned(),
+        token: "good-token".to_owned(),
+        relay_server: "127.0.0.1:21117".to_owned(),
+        ..Default::default()
+    });
+    a.send(&msg).await.unwrap();
+    let _ = relay_at_b(&mut b).await;
+
+    let mut peer = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let mut msg = RendezvousMessage::new();
+    msg.set_relay_response(RelayResponse {
+        socket_addr: AddrMangle::encode(a_addr).into(),
+        version: "1.5.0".to_owned(),
+        ..Default::default()
+    });
+    peer.send(&msg).await.unwrap();
+
+    match next_plaintext(&mut a, 3_000)
+        .await
+        .expect("the relay fallback ack was dropped — every relayed session would hang")
+        .union
+    {
+        Some(rendezvous_message::Union::RelayResponse(rs)) => {
+            assert!(rs.refuse_reason.is_empty());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// With `BROKER_VERIFY=N` the ledger is bypassed entirely and upstream's
+/// routing is back, hole included. Pinned so the escape hatch is known to work
+/// — it is the lever an operator pulls if T3.8 ever breaks their fleet.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_verification_off_a_stranger_can_answer_again() {
+    let api = stub(200, ALLOW).await;
+    let mut args = auth_args(&api);
+    args.push("--broker-verify".into());
+    args.push("N".into());
+    let s = hbbs(&args).await;
+    let mut b = register(s.port, "t33-dev-21").await;
+
+    let mut a = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let a_addr = a.local_addr();
+    let mut msg = RendezvousMessage::new();
+    msg.set_punch_hole_request(PunchHoleRequest {
+        id: "t33-dev-21".to_owned(),
+        licence_key: s.key.clone(),
+        token: "good-token".to_owned(),
+        ..Default::default()
+    });
+    a.send(&msg).await.unwrap();
+    let _ = next_from_hbbs(&mut b).await;
+
+    let mut evil = FramedStream::new(format!("127.0.0.1:{}", s.port), None, 3_000)
+        .await
+        .unwrap();
+    let mut msg = RendezvousMessage::new();
+    msg.set_punch_hole_sent(PunchHoleSent {
+        socket_addr: AddrMangle::encode(a_addr).into(),
         id: "t33-not-a-device".to_owned(),
         relay_server: "evil.example.com:21117".to_owned(),
         version: "1.5.0".to_owned(),
@@ -438,13 +681,11 @@ async fn a_stranger_can_still_answer_a_waiting_controller() {
 
     let msg = next_plaintext(&mut a, 2_500)
         .await
-        .expect("T3.8 may have landed: update this test");
+        .expect("BROKER_VERIFY=N did not restore upstream's routing");
     match msg.union {
         Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
             assert_eq!(ph.relay_server, "evil.example.com:21117");
-            assert!(ph.pk.is_empty(), "hbbs supplied a key for an unknown id");
         }
         other => panic!("unexpected {other:?}"),
     }
 }
-

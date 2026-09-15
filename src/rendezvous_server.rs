@@ -1,4 +1,5 @@
 use crate::auth::{self, AuthRequest, Authorizer};
+use crate::broker::{BrokerLedger, Verdict};
 use crate::common::*;
 use crate::peer::*;
 use hbb_common::{
@@ -120,6 +121,11 @@ pub struct RendezvousServer {
     /// process, and shared rather than cloned: it owns the HTTP connection pool
     /// to `apps/api` and the decision cache, both of which are worthless per-clone.
     authorizer: Arc<Authorizer>,
+    /// Which controller hbbs introduced to which peer (T3.8). Shared for the
+    /// same reason: a per-clone ledger would remember brokerages that the clone
+    /// answering the response has never heard of, which is "nobody can connect"
+    /// with extra steps.
+    broker: Arc<BrokerLedger>,
 }
 
 enum LoopFailure {
@@ -137,8 +143,9 @@ impl RendezvousServer {
         key: &str,
         rmem: usize,
         auth_config: auth::AuthConfig,
+        broker_config: crate::broker::BrokerConfig,
     ) -> ResultType<()> {
-        Self::start_with_bind(None, port, serial, key, rmem, auth_config)
+        Self::start_with_bind(None, port, serial, key, rmem, auth_config, broker_config)
     }
 
     #[tokio::main(flavor = "multi_thread")]
@@ -149,11 +156,13 @@ impl RendezvousServer {
         key: &str,
         rmem: usize,
         auth_config: auth::AuthConfig,
+        broker_config: crate::broker::BrokerConfig,
     ) -> ResultType<()> {
         // Inside the tokio runtime (`#[tokio::main]` above) and before any port
         // is bound, which is what `Authorizer::new` asks for: it builds the
         // reqwest client the whole process then shares.
         let authorizer = Arc::new(Authorizer::new(auth_config)?);
+        let broker = Arc::new(BrokerLedger::new(broker_config));
         let (key, sk) = Self::get_server_sk(key);
         let nat_port = port - 1;
         let ws_port = port + 2;
@@ -186,6 +195,7 @@ impl RendezvousServer {
             relay_servers0: Default::default(),
             rendezvous_servers: Arc::new(rendezvous_servers),
             authorizer,
+            broker,
             inner: Arc::new(Inner {
                 serial,
                 version,
@@ -647,7 +657,25 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
+                    // `addr_b` is misnamed upstream: it decodes to the *waiting
+                    // controller*, A, because that is the address hbbs put on
+                    // the `RequestRelay` it forwarded to B.
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
+                    // T3.8. An id is present only when B chose the relay server
+                    // itself (`create_relay(initiate = true)`), which is exactly
+                    // the case where the response steers A somewhere; the
+                    // fallback ack carries none and is checked on the brokerage
+                    // alone. See `BrokerLedger::check`.
+                    if let Verdict::Drop(why) = self.broker.check(
+                        try_into_v4(addr_b),
+                        rr.id(),
+                        try_into_v4(addr).ip(),
+                    ) {
+                        log::info!(
+                            "dropped a relay response to {addr_b:?} from {addr:?}: {why}"
+                        );
+                        return false;
+                    }
                     rr.socket_addr = Default::default();
                     let id = rr.id();
                     if !id.is_empty() {
@@ -773,6 +801,18 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        // T3.8. `addr_a` is chosen by whoever sent this message, so without the
+        // ledger any stranger who knows it can answer here — and by naming an id
+        // hbbs does not know, hand A an *empty* peer key, which the client reads
+        // as "no identity to verify" and connects anyway.
+        if let Verdict::Drop(why) = self.broker.check(
+            try_into_v4(addr_a),
+            &phs.id,
+            try_into_v4(addr).ip(),
+        ) {
+            log::info!("dropped a punch hole response to {addr_a:?} from {addr:?}: {why}");
+            return Ok(());
+        }
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
@@ -807,6 +847,17 @@ impl RendezvousServer {
             &addr_a,
             &addr
         );
+        // T3.8, and the same hole as `handle_hole_sent` — this one additionally
+        // lets the sender choose the *address* A is told to connect to, since
+        // `la.local_addr` is copied straight into the response.
+        if let Verdict::Drop(why) = self.broker.check(
+            try_into_v4(addr_a),
+            &la.id,
+            try_into_v4(addr).ip(),
+        ) {
+            log::info!("dropped a local addr response to {addr_a:?} from {addr:?}: {why}");
+            return Ok(());
+        }
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
@@ -952,6 +1003,14 @@ impl RendezvousServer {
                 }
                 if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
             }
+
+            // The brokerage (T3.8). Written here because everything below this
+            // line *is* the introduction: from the next statement on, hbbs has
+            // named A to B and will accept an answer addressed back to A.
+            // Normalised with `try_into_v4` to agree with `tcp_punch`'s key,
+            // which is what the response is ultimately routed through.
+            self.broker
+                .record(try_into_v4(addr), &id, try_into_v4(peer_addr).ip());
 
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
@@ -1175,8 +1234,17 @@ impl RendezvousServer {
 
         let mut msg_out = RendezvousMessage::new();
         rf.socket_addr = AddrMangle::encode(addr).into();
+        // Cloned, not taken: this message goes on to B exactly as upstream
+        // forwards it, field for field.
+        let peer_id = rf.id.clone();
         msg_out.set_request_relay(rf);
         let peer_addr = peer.read().await.socket_addr;
+        // A brokerage of its own (T3.8). The relay fallback arrives on a fresh
+        // TCP connection — `client.rs:1720` opens one per attempt on purpose —
+        // so A is waiting at an address the punch path never wrote down, and
+        // B's answer would have nothing to be checked against.
+        self.broker
+            .record(try_into_v4(addr), &peer_id, try_into_v4(peer_addr).ip());
         self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
     }
 

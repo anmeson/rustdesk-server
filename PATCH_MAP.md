@@ -89,6 +89,12 @@ cannot identify a session, so `hbbs` is the sole enforcement point
 | S10 | applied 2026-09-15 (T3.4) | `src/rendezvous_server.rs` (`:52-88` `Sink`/`Handshake`, `key_exchange_offer`, the `KeyExchange` arm in `handle_tcp`, the offer + decrypt in `handle_listener_inner`, `send_to_sink`) | the server half of `secure_tcp`: `hbbs` now sends a signed `KeyExchange` unprompted on every TCP connection, and keys both directions if the client answers | **without it, login is unusable.** `secure_tcp` blocks waiting for a server that never spoke, so a client with a licence key *and* a token stalled `READ_TIMEOUT` (18 s, measured) and failed **every** outbound connection (T0.6). It also takes the login token out of cleartext | Structural | ⚠ **high** — `handle_tcp`'s signature, `handle_listener_inner`'s read loop and the `Sink` enum are all upstream's |
 | S11 | applied 2026-09-15 (T3.4) | `tests/harness/` (new), `tests/t33_chokepoint.rs` | the S7 harness extracted into a shared module so T3.4's suite could spawn a real `hbbs` without copying it; `next_plaintext` added, mirroring the client's `get_next_nonkeyexchange_msg` | S7's tests are hand-rolled clients with none of the real client's tolerance for the new offer, so every one of them broke on it | Isolated | low |
 | S12 | applied 2026-09-15 (T3.4) | `tests/t34_key_exchange.rs` (new) | 9 tests: the offer and its signature, the token's absence from the actual bytes written, both directions encrypted, plaintext clients still served, and a plaintext peer answering an encrypted controller | a 🔴 change to the connect path of every connection | Isolated | low |
+| S13 | applied 2026-09-15 (T3.8) | `src/broker.rs` (new), `src/lib.rs` (`pub mod broker;`) | `BrokerLedger` — `A_addr → (peer id, peer ip)` with a 60 s TTL, plus `BrokerConfig` (`BROKER_VERIFY` on, `BROKER_STRICT_IP` off) read through the same `get_arg` mechanism as the `AUTH_*` keys | upstream routes three controller-bound messages on a sender-supplied address and checks nothing about who sent it; the ledger is what makes checking possible | Isolated | low — `common::get_arg_opt` only |
+| S14 | applied 2026-09-15 (T3.8) | `src/main.rs` (`:33-34`, `:42-46`, `:57`) | two `--broker-*` rows in the clap arg string; `BrokerConfig::from_args()?` + `.log()`, threaded into `start_with_bind` | same | Structural (small) | ⚠ medium — same arg string as S2 |
+| S15 | applied 2026-09-15 (T3.8) | `src/rendezvous_server.rs` (`:2`, `:122-128`, `:136-165`, `:196`) | `use crate::broker::{BrokerLedger, Verdict}`; `broker: Arc<BrokerLedger>` field; `broker_config` parameter on `start` / `start_with_bind` | the ledger needs the lifetime of the process, and must be *shared* — a per-clone ledger would not remember the brokerage the clone answering the response has to check | Structural | ⚠ medium — same churn as S4 |
+| S16 | applied 2026-09-15 (T3.8) | `src/rendezvous_server.rs` (in `handle_punch_hole_request`, beside the `PUNCH_REQS` ring; and at the tail of `handle_request_relay`) | two `broker.record(try_into_v4(addr), peer_id, try_into_v4(peer_addr).ip())` calls, at the two points where hbbs actually introduces a controller to a peer | there is no third place a brokerage begins. The relay one is separate because the fallback arrives on a **fresh TCP connection** (`client.rs:1720`), so A waits at an address the punch path never wrote down | Isolated | ⚠ medium — must stay on the *allow* side of S5/S8, or a refused connection becomes answerable |
+| S17 | applied 2026-09-15 (T3.8) | `src/rendezvous_server.rs` (`handle_hole_sent`, `handle_local_addr`, the `RelayResponse` arm in `handle_tcp`) | `broker.check(...)` before each forward; a `Verdict::Drop` returns without forwarding and without touching the sink | **this is the fix.** Without it a stranger who knows a waiting controller's address answers in the peer's place — and by naming an id hbbs does not know, hands A an empty peer key, which the client reads as "no identity to verify" (`apps/rustdesk/src/client.rs:1624-1634`) | Structural | ⚠ **high** — three separate sites in a file upstream reorders freely |
+| S18 | applied 2026-09-15 (T3.8) | `tests/t33_chokepoint.rs` | `a_stranger_can_still_answer_a_waiting_controller` rewritten to assert the fix, plus 5 tests: the brokered peer still gets through, `LocalAddr` and id-bearing `RelayResponse` refused, the id-less fallback ack still forwarded, and `BROKER_VERIFY=N` restoring upstream's routing | a 🔴 change to the routing every brokered connection depends on | Isolated | low |
 
 ### Notes on the `S` rows
 
@@ -130,6 +136,23 @@ otherwise: with no `AUTH_API_URL` configured, `Authorizer::authorize` returns a
 blind allow and the outbound messages go out byte-identical to upstream's
 (`with_authorization_off_the_wire_is_unchanged`, S7).
 
+**S17's ip layer is off by default, and that is a decision, not an oversight.**
+`BROKER_VERIFY` (the id check) ships on because it compares two strings and is
+blind to address family. `BROKER_STRICT_IP` ships **off** because B registers
+over UDP and answers over a new TCP connection, so the port never matches and
+even the ip is only usually the same — a dual-stack peer can register over IPv4
+and answer over IPv6, and CGNAT hands different flows different public
+addresses. Getting that wrong reads as "nobody can connect". Every mismatch is
+logged whether or not it is enforced, which is how an operator finds out if
+their fleet would survive turning it on. **Not verified against two real devices
+on a real network** — see the T3.8 note in TASK.md.
+
+**S16 and S17 are one patch in two halves and must move together.** A merge that
+keeps the checks and drops the recording produces a server that brokers
+connections and then refuses every answer to them — "nobody can connect", with
+the cause in a log line nobody is reading yet. `the_brokered_peer_still_answers_its_waiting_controller`
+(S18) is the test that catches it.
+
 **`libs/hbb_common` is untouched** and should stay that way. Everything above
 uses the proto exactly as upstream ships it: no field was added, and no field
 changed meaning. That is what keeps "no proto change, no client change" true.
@@ -140,4 +163,6 @@ changed meaning. That is what keeps "no proto change, no client change" true.
 
 | Site | What is wrong | Task |
 |---|---|---|
-| `handle_hole_sent` (`:722-748`), `handle_local_addr` (`:751-778`), and the `RelayResponse` arm (`:550-568`) | all three route on a `socket_addr` the **sender** supplies and check nothing about who sent it, so a stranger who knows a waiting controller's address as hbbs sees it can answer on the real peer's behalf — with an address and relay server of their choosing. Worse than a nuisance because naming an id hbbs does not know yields an empty peer key, and the client treats "no key" as "no identity to verify" and connects anyway (`apps/rustdesk/src/client.rs:1624-1634`). Demonstrated against the running binaries; the *text* half is closed by S9, the routing half is not. Pinned by `a_stranger_can_still_answer_a_waiting_controller` in S7 | **T3.8** |
+| The relay-fallback `RelayResponse` (`handle_tcp`) | carries **no id** — `create_relay` sends it with `initiate = false` (`apps/rustdesk/src/rendezvous_mediator.rs:579-604`) — so S17's id layer has nothing to check and only `BROKER_STRICT_IP`, which ships off, separates a stranger's ack from the real peer's. It steers the controller nowhere (A keeps its own uuid and relay server, `client.rs:1750-1760`), so this is a race and not a redirection. Pinned by `the_relay_fallback_ack_carries_no_id_and_still_reaches_the_controller` (S18) | residual of **T3.8** |
+| `BROKER_STRICT_IP` (S17) | implemented and **never run against two real devices on a real network**. The loopback harness cannot reach it — every party there shares 127.0.0.1 — so it is covered only by unit tests over `BrokerLedger::check`. The dual-stack and CGNAT cases the default protects against are therefore predicted, not observed | **T5.2** / **T5.10** |
+| `RegisterPk` (`:371-455`) | answers `OK` for any well-formed request: an unenrolled device can still claim an id and appear online | **T3.5.2** |

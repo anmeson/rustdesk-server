@@ -29,7 +29,9 @@ fn main() -> ResultType<()> {
         , --auth-required=[Y/N] 'Force authorization on or off (default: on when --auth-api-url is set)'
         , --auth-fail-open=[Y/N(default=N)] 'UNSUPPORTED. Broker connections when the auth API is unreachable'
         , --auth-timeout-ms=[NUMBER(default=300)] 'How long to wait for an authorization decision'
-        , --auth-cache-ttl-ms=[NUMBER(default=5000)] 'How long a positive decision may be reused'",
+        , --auth-cache-ttl-ms=[NUMBER(default=5000)] 'How long a positive decision may be reused'
+        , --broker-verify=[Y/N(default=Y)] 'Require a punch/relay response to come from the peer hbbs actually brokered'
+        , --broker-strict-ip=[Y/N(default=N)] 'Also require that response to arrive from the registered IP of that peer. Breaks dual-stack and CGNAT peers'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
     // Read and validated before anything binds a port. A misconfiguration here
@@ -38,6 +40,11 @@ fn main() -> ResultType<()> {
     // (T3.1, decision D1).
     let auth_config = auth::AuthConfig::from_args()?;
     auth_config.log();
+    // T3.8. Read here for the same reason, though nothing in it can fail: an
+    // operator who typed `BROKER_STRICT_IP` wants to see it echoed at boot, and
+    // the one line it logs is the only place the resolved value is visible.
+    let broker_config = broker::BrokerConfig::from_args()?;
+    broker_config.log();
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
     if port < 3 {
         bail!("Invalid port");
@@ -53,6 +60,7 @@ fn main() -> ResultType<()> {
         &get_arg_or("key", "-".to_owned()),
         rmem,
         auth_config,
+        broker_config,
     )?;
     Ok(())
 }
