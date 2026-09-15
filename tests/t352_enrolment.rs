@@ -78,6 +78,27 @@ const REG_BURST: usize = 3;
 /// misbehaving.
 const REG_WINDOW: Duration = Duration::from_millis(7_200);
 
+/// Registers a device **properly** — not just "got an `OK`".
+///
+/// The first contact is answered `OK` and deliberately not written to the peer
+/// table (the `deferred` branch), so a test that stops at the first `OK` is
+/// testing an unregistered device. `update_pk` in the log is the only honest
+/// signal that hbbs actually holds this peer, which is what the heartbeat path
+/// below depends on.
+async fn register_fully(hbbs: &Hbbs, sock: &mut FramedSocket, id: &str) {
+    let needle = format!("update_pk {id}");
+    for _ in 0..6 {
+        match register_pk_on(sock, hbbs.port, id, UUID, PK, 1_000).await {
+            Some(register_pk_response::Result::TOO_FREQUENT) => sleep(REG_WINDOW).await,
+            _ => {}
+        }
+        if hbbs.wait_for_log(&needle, 600).await {
+            return;
+        }
+    }
+    panic!("{id} never made it into the peer table\n{}", hbbs.log());
+}
+
 async fn register_until(
     sock: &mut FramedSocket,
     port: u16,
@@ -404,6 +425,117 @@ async fn an_unreadable_answer_is_an_outage_not_a_refusal() {
     assert!(
         hbbs.wait_for_log("unparseable json", 2_000).await,
         "the contract break was not logged\n{}",
+        hbbs.log()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3.5.4 — the heartbeat path
+// ---------------------------------------------------------------------------
+
+/// **The gap T3.5.2 left.** A client that has registered successfully sets
+/// `key_confirmed` and sends only `RegisterPeer` from then on, so the
+/// `RegisterPk` gate never sees it again. Un-enrolling a device in the console
+/// has to reach it anyway.
+#[tokio::test]
+async fn un_enrolling_a_registered_device_takes_it_offline() {
+    let enrolled_flag = Arc::new(AtomicBool::new(true));
+    let flag = enrolled_flag.clone();
+    let (stub, _) = enrol_stub(move |_| enrolled(flag.load(Ordering::SeqCst))).await;
+
+    let mut a = args(&stub);
+    a.extend(["--enrol-cache-ttl-ms".to_owned(), "200".to_owned()]);
+    let hbbs = hbbs(&a).await;
+    let mut sock = udp_socket().await;
+
+    // Properly registered first — the first contact is deferred, so this takes
+    // more than one round trip.
+    register_fully(&hbbs, &mut sock, "352000009").await;
+
+    // Settled: heartbeats are answered without asking for the key back.
+    let asked = register_peer_on(&mut sock, hbbs.port, "352000009", 2_000).await;
+    assert_eq!(
+        asked,
+        Some(false),
+        "hbbs asked a healthy device for its key\n{}",
+        hbbs.log()
+    );
+
+    // Now the console un-enrols it. No restart, no RegisterPk.
+    enrolled_flag.store(false, Ordering::SeqCst);
+    let mut refused = false;
+    for _ in 0..25 {
+        if register_peer_on(&mut sock, hbbs.port, "352000009", 1_000).await == Some(true) {
+            refused = true;
+            break;
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+    assert!(
+        refused,
+        "an un-enrolled device kept being told it was fine\n{}",
+        hbbs.log()
+    );
+    assert!(
+        hbbs.wait_for_log("gate=heartbeat outcome=not-deployed", 2_000).await,
+        "the heartbeat refusal was not logged\n{}",
+        hbbs.log()
+    );
+}
+
+/// `request_pk` is only useful if it lands the client somewhere that explains
+/// itself. It has to be the same `NOT_DEPLOYED` the client already handles.
+#[tokio::test]
+async fn the_heartbeat_walks_the_client_into_not_deployed() {
+    let (stub, _) = enrol_stub(|_| enrolled(false)).await;
+    let hbbs = hbbs(&args(&stub)).await;
+    let mut sock = udp_socket().await;
+
+    let settled = register_until(
+        &mut sock,
+        hbbs.port,
+        "352000010",
+        register_pk_response::Result::NOT_DEPLOYED,
+    )
+    .await;
+    assert_eq!(settled, register_pk_response::Result::NOT_DEPLOYED);
+
+    // And the heartbeat keeps pointing there rather than answering "you're fine".
+    let asked = register_peer_on(&mut sock, hbbs.port, "352000010", 2_000).await;
+    assert_eq!(
+        asked,
+        Some(true),
+        "the heartbeat let a refused device settle\n{}",
+        hbbs.log()
+    );
+}
+
+/// The heartbeat is every device every few seconds. With the feature off it must
+/// cost nothing at all, and with it on it must not cost an api call per beat.
+#[tokio::test]
+async fn the_heartbeat_does_not_ask_the_api_every_beat() {
+    let (stub, calls) = enrol_stub(|_| enrolled(true)).await;
+    let hbbs = hbbs(&args(&stub)).await;
+    let mut sock = udp_socket().await;
+
+    register_fully(&hbbs, &mut sock, "352000011").await;
+    let after_registration = calls.load(Ordering::SeqCst);
+
+    for _ in 0..12 {
+        let asked = register_peer_on(&mut sock, hbbs.port, "352000011", 1_000).await;
+        assert_eq!(
+            asked,
+            Some(false),
+            "a healthy device was asked for its key\n{}",
+            hbbs.log()
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        after_registration,
+        "twelve heartbeats cost api calls inside one cache TTL\n{}",
         hbbs.log()
     );
 }

@@ -384,6 +384,14 @@ async fn records_are_replayed_once_the_api_comes_back() {
     assert!(posted.contains("x-hbbs-secret"), "reconciliation went unauthenticated");
     assert!(posted.contains("\"admin_id\":\"alice\""));
     assert!(posted.contains("\"outcome\":\"used\""));
+    // T2.7: the capability's own expiry travels with the record. It is the only
+    // way anything server-side can ever learn it — capabilities are minted
+    // offline — and without it the console cannot say whether an emergency
+    // window is still open.
+    assert!(
+        posted.contains("\"exp\":"),
+        "the record carried no expiry:\n{posted}"
+    );
 
     // And it stops being sent. Counted from the moment of delivery, not from
     // the start: every tick during the outage POSTed this record too and was

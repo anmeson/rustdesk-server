@@ -110,6 +110,8 @@ cannot identify a session, so `hbbs` is the sole enforcement point
 | S31 | applied 2026-09-15 (T3.5.2) | `src/rendezvous_server.rs` (`:1`, the `enrolment` field, `start`/`start_with_bind`, and ~40 lines in the `RegisterPk` arm) | the verdict read, the `NOT_DEPLOYED` refusal, and the deferred first contact | **the registration boundary.** It reads memory only and spawns the api call, because `handle_udp` is awaited **inline** in `io_loop` (`:339`) while the TCP path spawns per connection (`:1584`) — an HTTP call here would put every datagram the server handles, for the whole fleet, behind one round trip | Structural | ⚠ **high** — same file and same churn as S5 and S8 |
 | S32 | applied 2026-09-15 (T3.5.2) | `src/main.rs` (three `--enrol-*` rows, `EnrolmentConfig::from_args` + `.log()`) | same | the fourth block of rows in one arg string | Structural (small) | ⚠ medium — same arg string as S2, S14, S21, S24 |
 | S33 | applied 2026-09-15 (T3.5.2) | `tests/t352_enrolment.rs` (new), `tests/harness/mod.rs` (`register_pk_on`, `udp_socket`, `enrol_args`, `enrolled`, `is_enrolment`) | 9 tests against the real binary: refused and told to deploy, enrolled and registered, the answer cached across six registrations, an api outage that deregisters nobody, a deployed device recovering on its own, a refused device not claiming the id, `AUTH_API_URL` alone not turning it on, a boot refusal, and an unparseable answer read as an outage | a 🔴 gate whose failure mode is a fleet going dark needs the outage cases proved, not only the refusal | Isolated | low |
+| S34 | applied 2026-09-15 (T3.5.4) | `src/rendezvous_server.rs` (`update_addr`, `:849-925`) | the same enrolment verdict read on the **`RegisterPeer` heartbeat**, forcing `request_pk: true` for a refused peer | S31 alone does not reach a device that is *already* registered: a settled client sets `key_confirmed` and stops sending `RegisterPk` entirely, so un-enrolling it in the console left it showing online forever. `request_pk` walks the client back into the arm where `NOT_DEPLOYED` lives, and because `last_reg_time` is refreshed only when we are *not* asking, the device ages out through upstream's own `REG_TIMEOUT` rather than through anything of ours | Structural | ⚠ **high** — same file as S5/S8/S31, and this one is on the hottest path in the server |
+| S35 | applied 2026-09-15 (T2.7) | `src/breakglass.rs` (`AuditRecord.exp`) | the capability's own expiry carried on every audit record and therefore into `POST /api/internal/breakglass/reconcile` | the console cannot learn it any other way. Capabilities are minted **offline**, so the only moment a server hears of one is when it is used — without this a reconciled record says an emergency access happened but not whether it is still happening. `#[serde(default)]`, because the audit log is append-only and may span an upgrade: a record that fails to parse wedges every record behind it | Isolated | low — our own format |
 
 ### Notes on the `S` rows
 
@@ -212,14 +214,15 @@ would otherwise start refusing every device that had never been through
 `rustdesk --deploy` — a fleet-wide outage produced by installing a patch
 release. `the_api_url_alone_does_not_turn_it_on` (S33) pins it.
 
-**A device that is *already* registered is never re-checked.** The verdict is
-read in the `RegisterPk` arm, and a settled client stops sending `RegisterPk`
-entirely — `key_confirmed` is true, so it sends `RegisterPeer` heartbeats and
-nothing else (`apps/rustdesk/src/rendezvous_mediator.rs`). So un-enrolling a
-device in the console does not take it offline; it stops being *reachable*
-immediately, because the connection gate (S5, S8) asks `apps/api` on every
-connection and is not cached for more than 5 s, but it keeps showing as online.
-See the gap table below — **T3.5.4**.
+**S34 is on the heartbeat path and must stay an in-memory read.** It exists
+because S31 alone cannot reach a device that is already registered: a settled
+client sets `key_confirmed` and stops sending `RegisterPk` entirely — it sends
+`RegisterPeer` and nothing else (`apps/rustdesk/src/rendezvous_mediator.rs`).
+This runs for every device every few seconds, so the verdict is read from the
+peer under a lock and the api call is spawned, sharing S29's
+`ENROL_RATE_PER_MINUTE` budget deliberately: two paths that each had their own
+would add up to more than an operator asked for. `the_heartbeat_does_not_ask_the_api_every_beat`
+(S33) is the test that catches a merge that turns this into a call per beat.
 
 **`libs/hbb_common` is untouched** and should stay that way. Everything above
 uses the proto exactly as upstream ships it: no field was added, and no field
@@ -234,5 +237,4 @@ changed meaning. That is what keeps "no proto change, no client change" true.
 | The relay-fallback `RelayResponse` (`handle_tcp`) | carries **no id** — `create_relay` sends it with `initiate = false` (`apps/rustdesk/src/rendezvous_mediator.rs:579-604`) — so S17's id layer has nothing to check and only `BROKER_STRICT_IP`, which ships off, separates a stranger's ack from the real peer's. It steers the controller nowhere (A keeps its own uuid and relay server, `client.rs:1750-1760`), so this is a race and not a redirection. Pinned by `the_relay_fallback_ack_carries_no_id_and_still_reaches_the_controller` (S18) | residual of **T3.8** |
 | `BROKER_STRICT_IP` (S17) | implemented and **never run against two real devices on a real network**. The loopback harness cannot reach it — every party there shares 127.0.0.1 — so it is covered only by unit tests over `BrokerLedger::check`. The dual-stack and CGNAT cases the default protects against are therefore predicted, not observed | **T5.2** / **T5.10** |
 | `breakglass::Breakglass` nonce store (S19) | **per process**: a capability spent against one hbbs can be spent again against another, or against the same one after a restart. Bounded by `exp` (minutes). Closing it means shared state between rendezvous servers | accepted, documented |
-| `RegisterPeer` / `update_addr` (`:820-860`) | the enrolment verdict is read at `RegisterPk` only, and a settled client never sends one again. A device un-enrolled after it registered keeps heartbeating and keeps showing as online — it is not *reachable*, because the connection gate asks `apps/api` every time, but the device list is wrong | **T3.5.4** |
 | `Enrolment`'s pk check | `apps/api` records a changed public key and does **not** refuse on it, because which key pair `rustdesk --deploy` reads on an installed host is not settled — T3.5.1 could not run the CLI (it needs `/Applications` + root). The strict reading of T3.5.2 is one line away in `services/enrolment.ts` | **T5.5** |

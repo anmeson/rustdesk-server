@@ -463,6 +463,7 @@ impl Breakglass {
             to_id: to_id.to_owned(),
             nonce: cap.nonce.clone(),
             from_ip: from_ip.to_owned(),
+            exp: cap.exp,
             outcome: outcome.to_owned(),
         }) {
             log::error!(
@@ -654,6 +655,20 @@ pub struct AuditRecord {
     pub to_id: String,
     pub nonce: String,
     pub from_ip: String,
+    /// The capability's own expiry, unix seconds — TASK.md T2.7.
+    ///
+    /// Carried because the console cannot get it any other way. A capability is
+    /// minted **offline**, by a private key no server holds, so the *only*
+    /// moment anything server-side learns when one stops being valid is when
+    /// somebody uses it. Without this field a reconciled record says an
+    /// emergency access happened but not whether it is still happening, and
+    /// "is a break-glass window open right now" has no answer.
+    ///
+    /// `#[serde(default)]` so that records written before this field existed
+    /// still parse — an audit log is append-only and may span an upgrade, and a
+    /// record that fails to parse wedges every record behind it.
+    #[serde(default)]
+    pub exp: i64,
     /// `used` or `replay`. The api's own file has no such field because its
     /// unique index makes the distinction for it; hbbs has to say so itself, or
     /// a reconciled replay is indistinguishable from a reconciled first use.
@@ -1339,6 +1354,7 @@ mod tests {
                 to_id: "dev-1".into(),
                 nonce: format!("n{i}"),
                 from_ip: "ip".into(),
+                exp: 0,
                 outcome: OUTCOME_USED.to_owned(),
             })
             .unwrap();
@@ -1358,6 +1374,7 @@ mod tests {
             to_id: "dev-1".into(),
             nonce: "n3".into(),
             from_ip: "ip".into(),
+            exp: 0,
             outcome: OUTCOME_USED.to_owned(),
         })
         .unwrap();
@@ -1377,6 +1394,7 @@ mod tests {
                 to_id: "dev-1".into(),
                 nonce: format!("b{i}"),
                 from_ip: "ip".into(),
+                exp: 0,
                 outcome: OUTCOME_USED.to_owned(),
             })
             .unwrap();
@@ -1401,6 +1419,7 @@ mod tests {
             to_id: "dev-1".into(),
             nonce: "r0".into(),
             from_ip: "ip".into(),
+            exp: 0,
             outcome: OUTCOME_USED.to_owned(),
         })
         .unwrap();
@@ -1414,6 +1433,7 @@ mod tests {
             to_id: "dev-1".into(),
             nonce: "r1".into(),
             from_ip: "ip".into(),
+            exp: 0,
             outcome: OUTCOME_USED.to_owned(),
         })
         .unwrap();
@@ -1435,6 +1455,7 @@ mod tests {
             to_id: "dev-1".into(),
             nonce: "p0".into(),
             from_ip: "ip".into(),
+            exp: 0,
             outcome: OUTCOME_USED.to_owned(),
         })
         .unwrap();
@@ -1458,6 +1479,7 @@ mod tests {
             to_id: "dev-1".into(),
             nonce: "g0".into(),
             from_ip: "ip".into(),
+            exp: 0,
             outcome: OUTCOME_USED.to_owned(),
         })
         .unwrap();

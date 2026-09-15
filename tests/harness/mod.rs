@@ -487,6 +487,32 @@ pub async fn register_pk_on(
     }
 }
 
+/// Sends one `RegisterPeer` — the keepalive a settled client sends instead of
+/// `RegisterPk` — and returns whether hbbs asked for the public key back.
+///
+/// `request_pk` is the only lever hbbs has on this path, and T3.5.4 uses it: it
+/// is how a device that has stopped sending `RegisterPk` is walked back into the
+/// arm where `NOT_DEPLOYED` lives.
+pub async fn register_peer_on(
+    sock: &mut FramedSocket,
+    port: u16,
+    id: &str,
+    ms: u64,
+) -> Option<bool> {
+    let server: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut msg = RendezvousMessage::new();
+    msg.set_register_peer(RegisterPeer {
+        id: id.to_owned(),
+        ..Default::default()
+    });
+    sock.send(&msg, server).await.unwrap();
+    let (bytes, _) = sock.next_timeout(ms).await?.ok()?;
+    match RendezvousMessage::parse_from_bytes(&bytes).unwrap().union {
+        Some(rendezvous_message::Union::RegisterPeerResponse(r)) => Some(r.request_pk),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 /// A fresh UDP socket to speak `RegisterPk` from.
 pub async fn udp_socket() -> FramedSocket {
     FramedSocket::new("127.0.0.1:0".parse::<SocketAddr>().unwrap())

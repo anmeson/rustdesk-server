@@ -852,7 +852,73 @@ impl RendezvousServer {
         socket_addr: SocketAddr,
         socket: &mut FramedSocket,
     ) -> ResultType<()> {
-        let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(&id).await {
+        let peer = self.pm.get_in_memory(&id).await;
+
+        // --- Registration ownership on the heartbeat path, TASK.md T3.5.4 ----
+        // The `RegisterPk` gate (T3.5.2) is not enough on its own: a settled
+        // client sets `key_confirmed` and **stops sending `RegisterPk`
+        // entirely**, so a device un-enrolled after it registered would never be
+        // asked about again and would keep showing as online forever. (It stops
+        // being *reachable* the moment the console says so — that decision is
+        // the connection gate's and is never cached for more than 5 s — but the
+        // device list would be lying.)
+        //
+        // **This is the hottest path in the server**: every device, every few
+        // seconds. So it is an in-memory read and a lock, and the api call, if
+        // there is one, is spawned and bounded by `ENROL_RATE_PER_MINUTE` — the
+        // same budget T3.5.2 uses, deliberately shared so the two paths cannot
+        // add up to more than an operator asked for.
+        let refused = if self.enrolment.enabled() {
+            match &peer {
+                Some(lock) => {
+                    let (status, checked_at, uuid, pk) = {
+                        let p = lock.read().await;
+                        (p.status, p.enrol_checked, p.uuid.clone(), p.pk.clone())
+                    };
+                    let verdict = self.enrolment.verdict(status);
+                    // An empty `pk` is a peer that has not actually registered —
+                    // there is nothing to identify it by, and the `RegisterPk`
+                    // arm is about to handle it anyway.
+                    if !pk.is_empty()
+                        && (verdict == EnrolVerdict::Unknown
+                            || self.enrolment.stale(checked_at))
+                    {
+                        // A refresh that is skipped (budget spent) does not stamp
+                        // `enrol_checked`, so it is retried on the next beat
+                        // rather than lost. That is also what spreads a fleet
+                        // whose verdicts all expire at once: whoever gets a
+                        // token resets their own clock and stops competing.
+                        enrolment::refresh(
+                            self.enrolment.clone(),
+                            self.pm.db.clone(),
+                            lock.clone(),
+                            id.clone(),
+                            uuid,
+                            pk,
+                        );
+                    }
+                    verdict == EnrolVerdict::Refused
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        // One line per un-enrolment, not one per beat, and it self-limits rather
+        // than being throttled: the client answers `request_pk` by clearing
+        // `key_confirmed`, and from then on it sends `RegisterPk` instead of
+        // heartbeats — so this branch is reached once and the `gate=register`
+        // line takes over. Observed exactly once against a real client.
+        if refused {
+            log::info!(
+                "enrol gate=heartbeat outcome=not-deployed id={:?} ip={:?}",
+                id,
+                socket_addr.ip()
+            );
+        }
+        // --------------------------------------------------------------------
+
+        let (request_pk, ip_change) = if let Some(old) = peer {
             let mut old = old.write().await;
             let ip = socket_addr.ip();
             let ip_change = if old.socket_addr.port() != 0 {
@@ -860,7 +926,14 @@ impl RendezvousServer {
             } else {
                 ip.to_string() != old.info.ip
             } && !ip.is_loopback();
-            let request_pk = old.pk.is_empty() || ip_change;
+            // `refused` first, and the ordering is the whole mechanism: asking
+            // for the pk walks the client into the `RegisterPk` arm, which is
+            // where `NOT_DEPLOYED` lives and where the client already knows what
+            // to do with it. And because `last_reg_time` is refreshed only when
+            // we are *not* asking, a refused device simply stops being kept
+            // alive and ages out through upstream's own `REG_TIMEOUT` — no
+            // destructive write, no new offline mechanism.
+            let request_pk = refused || old.pk.is_empty() || ip_change;
             if !request_pk {
                 old.socket_addr = socket_addr;
                 old.last_reg_time = Instant::now();
