@@ -1,16 +1,33 @@
 //! Shared harness for the `hbbs` integration tests.
 //!
 //! Extracted from `t33_chokepoint.rs` when T3.4 needed the same spawn-a-real-
-//! server machinery. Still the throwaway one — T5.1 owns the standing harness —
-//! but shared rather than copied, so a fix to the port allocator or the startup
-//! race is a fix for every suite at once.
+//! server machinery, and **grown into the standing harness by T5.1** rather than
+//! replaced — the port allocator, the temp directory and the startup race below
+//! are the four things that made the first suite flaky, and rediscovering them
+//! in a second harness was never going to be cheaper than sharing this one.
 //!
-//! Spawns the real `hbbs` binary and speaks the real wire protocol at it: UDP
-//! `RegisterPk` / `RegisterPeer` as device B, TCP `PunchHoleRequest` /
-//! `RequestRelay` as controller A.
+//! This file is the hbbs half: spawn the real binary, speak the real wire
+//! protocol at it — UDP `RegisterPk` / `RegisterPeer` as device B, TCP
+//! `PunchHoleRequest` / `RequestRelay` as controller A — and answer it with a
+//! stub api that can be made to misbehave.
+//!
+//! Milestone 5 needs three things a stub cannot provide, and each is a module:
+//!
+//!   - [`api`] — the real `apps/api` on its own database, with the console and
+//!     client endpoints driven over HTTP. A stub cannot *decide* anything.
+//!   - [`relay`] — the real `hbbr`, and the bytes that go through it.
+//!   - [`peer`] — two clients rather than one socket, each with its own token.
+//!
+//! and [`world`] brings all four up together, which is the unit a Milestone 5
+//! test is written against.
 
 // Each test binary uses a different subset of this.
 #![allow(dead_code)]
+
+pub mod api;
+pub mod peer;
+pub mod relay;
+pub mod world;
 
 
 use hbb_common::{
@@ -258,11 +275,26 @@ pub async fn hbbs(extra: &[String]) -> Hbbs {
     hbbs_with_key("_", extra).await
 }
 
+/// `hbbs` with extra environment variables as well as flags.
+///
+/// Not every switch has a flag. `ALWAYS_USE_RELAY` — the one T5.10 turns the
+/// whole matrix on — is read through `get_arg` (`rendezvous_server.rs:253`),
+/// which covers the environment and a `.env` file but has no CLI form. Since
+/// the spawn uses `env_clear`, setting it in the test process would not reach
+/// the child either.
+pub async fn hbbs_full(key: &str, extra: &[String], env: &[(&str, String)]) -> Hbbs {
+    hbbs_spawn(key, extra, env).await
+}
+
 /// `hbbs` with an explicit `-k`. `"_"` is the usual one — it makes `hbbs`
 /// generate a key pair and write the public half to `id_ed25519.pub`, which is
 /// where `Hbbs::key` comes from. `""` is the keyless deployment CONTEXT.md §7
 /// warns about, and is its own case for T3.4.
 pub async fn hbbs_with_key(key: &str, extra: &[String]) -> Hbbs {
+    hbbs_spawn(key, extra, &[]).await
+}
+
+async fn hbbs_spawn(key: &str, extra: &[String], extra_env: &[(&str, String)]) -> Hbbs {
     // Every test wants its own `hbbs`, and nine of them starting at once — each a
     // multi-threaded runtime opening its own sqlite — is enough load on a laptop
     // to push startup past any sane timeout. Cap how many exist at a time; the
@@ -298,6 +330,9 @@ pub async fn hbbs_with_key(key: &str, extra: &[String]) -> Hbbs {
         ));
     for a in extra {
         cmd.arg(a);
+    }
+    for (name, value) in extra_env {
+        cmd.env(name, value);
     }
     // The guard is built *before* anything below can panic. `hbbs` binds with
     // SO_REUSEPORT, so a leaked one does not fail the next test's bind — it

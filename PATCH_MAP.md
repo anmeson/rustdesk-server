@@ -112,8 +112,19 @@ cannot identify a session, so `hbbs` is the sole enforcement point
 | S33 | applied 2026-09-15 (T3.5.2) | `tests/t352_enrolment.rs` (new), `tests/harness/mod.rs` (`register_pk_on`, `udp_socket`, `enrol_args`, `enrolled`, `is_enrolment`) | 9 tests against the real binary: refused and told to deploy, enrolled and registered, the answer cached across six registrations, an api outage that deregisters nobody, a deployed device recovering on its own, a refused device not claiming the id, `AUTH_API_URL` alone not turning it on, a boot refusal, and an unparseable answer read as an outage | a 🔴 gate whose failure mode is a fleet going dark needs the outage cases proved, not only the refusal | Isolated | low |
 | S34 | applied 2026-09-15 (T3.5.4) | `src/rendezvous_server.rs` (`update_addr`, `:849-925`) | the same enrolment verdict read on the **`RegisterPeer` heartbeat**, forcing `request_pk: true` for a refused peer | S31 alone does not reach a device that is *already* registered: a settled client sets `key_confirmed` and stops sending `RegisterPk` entirely, so un-enrolling it in the console left it showing online forever. `request_pk` walks the client back into the arm where `NOT_DEPLOYED` lives, and because `last_reg_time` is refreshed only when we are *not* asking, the device ages out through upstream's own `REG_TIMEOUT` rather than through anything of ours | Structural | ⚠ **high** — same file as S5/S8/S31, and this one is on the hottest path in the server |
 | S35 | applied 2026-09-15 (T2.7) | `src/breakglass.rs` (`AuditRecord.exp`) | the capability's own expiry carried on every audit record and therefore into `POST /api/internal/breakglass/reconcile` | the console cannot learn it any other way. Capabilities are minted **offline**, so the only moment a server hears of one is when it is used — without this a reconciled record says an emergency access happened but not whether it is still happening. `#[serde(default)]`, because the audit log is append-only and may span an upgrade: a record that fails to parse wedges every record behind it | Isolated | low — our own format |
+| S36 | applied 2026-09-15 (T5.1) | `tests/harness/api.rs`, `tests/harness/relay.rs`, `tests/harness/peer.rs`, `tests/harness/world.rs` (all new), `tests/harness/mod.rs` (`hbbs_full`), `tests/t51_harness.rs` (new) | the standing end-to-end harness: a real `apps/api` on its own MongoDB database, a real `hbbs` pointed at it, a real `hbbr` sharing its key, and two clients with two tokens — brought up together as a `World`, with fixtures built through the console's own API and sessions carried through the relay as bytes | every remaining Milestone 5 question needs something a stub cannot do: *decide*. A stub can return garbage or a 503, which is what S7's harness is for, but it cannot tell a grant from a revocation, and the bypass tests (T5.7) are worth nothing against a simulated relay | Isolated | low — test-only; it spawns the binaries and speaks the wire, and patches neither |
+
 
 ### Notes on the `S` rows
+
+**S36's harness reaches `hbbr` on the LAN address, not on loopback, and that is
+not a preference.** `handle_connection` (`src/relay_server.rs:386-393`) answers
+every non-websocket loopback connection with the runtime console instead of
+relaying — no log line, no error, and a session that pairs with nobody. It is
+upstream behaviour, `hbbr` stays unpatched, and the consequence is a deployment
+note as much as a test one: an all-on-one-host `hbbs` configured with
+`-r 127.0.0.1:21117` has working direct connections and every relayed one
+hanging. Recorded in docs/CONTEXT.md §7, which did not say so before T5.1.
 
 **S10 is where to look if clients hang after a merge.** Three things have to
 stay together or the handshake half-works: the offer must be sent *before* the
