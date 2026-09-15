@@ -572,6 +572,19 @@ impl ClientApi {
             .to_owned()
     }
 
+    /// `POST /api/logout` — revokes the token it is sent with.
+    ///
+    /// The client calls this when a user signs out, and T5.9's subject is what
+    /// it does *not* do: end a session that is already running.
+    pub async fn logout(&self, token: &str) {
+        self.http
+            .post(format!("{}/api/logout", self.base))
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+            .send()
+            .await
+            .expect("logout failed");
+    }
+
     /// The heartbeat the controlled device sends every 3 s — the channel a
     /// force-disconnect comes back on (decision D2). T5.3 drives it directly.
     pub async fn heartbeat(&self, body: Value) -> Value {

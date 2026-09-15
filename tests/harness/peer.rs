@@ -444,6 +444,32 @@ impl Controller {
         Ok((a_end, b_end, forwarded))
     }
 
+    /// Sends one `PunchHoleRequest` and returns A's still-open stream, without
+    /// waiting for anything.
+    ///
+    /// The counterpart of [`request_relay_alone`](Self::request_relay_alone) for
+    /// the punch gate, and the tool for asking *where* hbbs forwarded a
+    /// brokerage rather than whether the connection completed. The stream is
+    /// returned rather than dropped because hbbs parks A's sink under its
+    /// address for the duration (`rendezvous_server.rs:750`), and a caller that
+    /// dropped it would be testing a connection that went away.
+    pub async fn punch_alone(&self, to_id: &str) -> FramedStream {
+        let mut stream = FramedStream::new(format!("127.0.0.1:{}", self.hbbs_port), None, 3_000)
+            .await
+            .expect("controller could not reach hbbs");
+        let mut msg = RendezvousMessage::new();
+        msg.set_punch_hole_request(PunchHoleRequest {
+            id: to_id.to_owned(),
+            licence_key: self.key.clone(),
+            token: self.token.clone(),
+            conn_type: ConnType::DEFAULT_CONN.into(),
+            nat_type: NatType::ASYMMETRIC.into(),
+            ..Default::default()
+        });
+        stream.send(&msg).await.unwrap();
+        stream
+    }
+
     /// Asks hbbs for a relay and returns only what A was told, without a device
     /// on the other end. T5.7's forged-token cases want exactly this.
     pub async fn request_relay_alone(&self, to_id: &str, ms: u64) -> Option<RelayResponse> {
