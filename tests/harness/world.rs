@@ -66,6 +66,7 @@ pub struct WorldBuilder {
     reconcile_sec: u64,
     enrol_cache_ttl_ms: Option<u64>,
     fault_injection: bool,
+    authorization: bool,
 }
 
 impl Default for WorldBuilder {
@@ -85,6 +86,7 @@ impl Default for WorldBuilder {
             breakglass: None,
             enrol_cache_ttl_ms: None,
             fault_injection: false,
+            authorization: true,
             // The 60 s production default is right for production and useless
             // here: reconciliation is the thing under test, not something to
             // wait a minute for.
@@ -167,6 +169,22 @@ impl WorldBuilder {
         self
     }
 
+    /// Boots hbbs with **no authorization at all** — T5.8's baseline.
+    ///
+    /// Not a switch hbbs has: leaving `AUTH_API_URL` unset is what turns it off,
+    /// and `required` then defaults to false (`auth.rs:106`). So this world runs
+    /// upstream's connect path, with our two call sites reduced to one branch
+    /// each — which is the only honest "before" to measure an "after" against,
+    /// and it is measured on the same machine, in the same run, with the same
+    /// fixtures rather than against a number from another day.
+    ///
+    /// The api still runs, because the console still has to build the fixtures.
+    /// hbbs simply never asks it anything.
+    pub fn authorization(mut self, on: bool) -> Self {
+        self.authorization = on;
+        self
+    }
+
     /// Puts a fault injector between hbbs and the api — T5.6.
     ///
     /// Off by default, and it changes nothing until a test sets a fault: a
@@ -211,19 +229,20 @@ impl WorldBuilder {
             None => api.base(),
         };
 
-        let mut args = vec![
-            "--auth-api-url".to_owned(),
-            auth_url,
-            "--auth-api-secret".to_owned(),
-            SHARED_SECRET.to_owned(),
-            "--auth-timeout-ms".to_owned(),
-            self.auth_timeout_ms.to_string(),
-            "-r".to_owned(),
-            relay_addr.clone(),
-        ];
-        if let Some(ttl) = self.auth_cache_ttl_ms {
-            args.push("--auth-cache-ttl-ms".to_owned());
-            args.push(ttl.to_string());
+        let mut args = vec!["-r".to_owned(), relay_addr.clone()];
+        if self.authorization {
+            args.extend([
+                "--auth-api-url".to_owned(),
+                auth_url,
+                "--auth-api-secret".to_owned(),
+                SHARED_SECRET.to_owned(),
+                "--auth-timeout-ms".to_owned(),
+                self.auth_timeout_ms.to_string(),
+            ]);
+            if let Some(ttl) = self.auth_cache_ttl_ms {
+                args.push("--auth-cache-ttl-ms".to_owned());
+                args.push(ttl.to_string());
+            }
         }
         if self.enrol_required {
             args.push("--enrol-required".to_owned());
