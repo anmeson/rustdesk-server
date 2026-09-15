@@ -248,6 +248,10 @@ fn is_loopback(url: &str) -> bool {
 /// `POST` target on the api server. `apps/api/src/routes/internal/authorize.ts`.
 const AUTHORIZE_PATH: &str = "/api/internal/authorize";
 
+/// The two chokepoints, as the decision log names them (T3.7).
+pub const GATE_PUNCH: &str = "punch";
+pub const GATE_RELAY: &str = "relay";
+
 /// The api server authenticates hbbs with this header, not with a bearer token.
 const SECRET_HEADER: &str = "x-hbbs-secret";
 
@@ -286,6 +290,11 @@ pub struct AuthRequest<'a> {
     /// Protobuf `ConnType` name, from `conn_type_name`.
     pub conn_type: &'a str,
     pub from_ip: &'a str,
+    /// Which chokepoint asked — `punch` or `relay` (T3.7). Not sent to the api;
+    /// it exists so the decision log says *which* of the two gates a connection
+    /// was stopped at, which is the first thing anyone wants to know and the
+    /// one thing the api cannot tell them.
+    pub gate: &'a str,
 }
 
 /// Where an answer came from. Carried on the decision so that T3.7 can log it
@@ -454,6 +463,144 @@ impl CacheKey {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Structured decision logging — TASK.md T3.7
+// ---------------------------------------------------------------------------
+
+/// How many denials are kept for the runtime console.
+///
+/// Small on purpose: this is a *tail*, not storage. The durable record is the
+/// log line, which already has a rotation policy; keeping thousands here would
+/// be a second, worse log that only one operator on one host can read.
+const RECENT_DENIALS: usize = 200;
+
+/// One refused connection attempt, as the console prints it.
+#[derive(Clone)]
+pub struct DeniedAttempt {
+    pub at: Instant,
+    pub gate: &'static str,
+    pub from_ip: String,
+    pub to_id: String,
+    pub conn_type: String,
+    pub source: DecisionSource,
+    pub reason: String,
+}
+
+/// Counters behind the console's `auth-decisions` command — T3.7.
+///
+/// **This is the audit trail for connections that never became sessions.**
+/// Everything that *does* become a session is in `connection_logs` on the api
+/// side; a refusal leaves nothing there at all when the api was never asked —
+/// which is every no-token, every fail-closed, and every break-glass refusal.
+/// Those are exactly the attempts an operator wants to see, and until this
+/// existed they were visible only by reading the log by hand.
+#[derive(Default)]
+pub struct DecisionStats {
+    allow: u64,
+    deny: u64,
+    /// Indexed by `DecisionSource` in the order `SOURCES` lists them.
+    by_source: [u64; 7],
+    latency_count: u64,
+    latency_total_us: u64,
+    latency_max_us: u64,
+    recent_denials: std::collections::VecDeque<DeniedAttempt>,
+}
+
+const SOURCES: [DecisionSource; 7] = [
+    DecisionSource::Disabled,
+    DecisionSource::NoToken,
+    DecisionSource::Api,
+    DecisionSource::Cache,
+    DecisionSource::FailedClosed,
+    DecisionSource::FailedOpen,
+    DecisionSource::Breakglass,
+];
+
+impl DecisionSource {
+    fn index(self) -> usize {
+        match self {
+            Self::Disabled => 0,
+            Self::NoToken => 1,
+            Self::Api => 2,
+            Self::Cache => 3,
+            Self::FailedClosed => 4,
+            Self::FailedOpen => 5,
+            Self::Breakglass => 6,
+        }
+    }
+}
+
+impl DecisionStats {
+    fn record(&mut self, gate: &'static str, req: &AuthRequest<'_>, decision: &AuthDecision) {
+        if decision.allow {
+            self.allow += 1;
+        } else {
+            self.deny += 1;
+            if self.recent_denials.len() >= RECENT_DENIALS {
+                self.recent_denials.pop_front();
+            }
+            self.recent_denials.push_back(DeniedAttempt {
+                at: Instant::now(),
+                gate,
+                from_ip: req.from_ip.to_owned(),
+                to_id: req.to_id.to_owned(),
+                conn_type: req.conn_type.to_owned(),
+                source: decision.source,
+                reason: decision.reason.clone(),
+            });
+        }
+        self.by_source[decision.source.index()] += 1;
+
+        // Only decisions that could have cost time are timed. A `Disabled`
+        // blind allow is a branch, and averaging thousands of those in would
+        // make the number that matters — how long a human waits on the api —
+        // read as near zero.
+        if !matches!(decision.source, DecisionSource::Disabled) {
+            let us = decision.latency.as_micros() as u64;
+            self.latency_count += 1;
+            self.latency_total_us += us;
+            self.latency_max_us = self.latency_max_us.max(us);
+        }
+    }
+
+    pub fn allows(&self) -> u64 {
+        self.allow
+    }
+
+    pub fn denials(&self) -> u64 {
+        self.deny
+    }
+
+    pub fn by_source(&self) -> Vec<(&'static str, u64)> {
+        SOURCES
+            .iter()
+            .map(|s| (s.label(), self.by_source[s.index()]))
+            .filter(|(_, n)| *n > 0)
+            .collect()
+    }
+
+    /// `(mean ms, max ms)` over decisions that were not a disabled no-op.
+    pub fn latency_ms(&self) -> (f64, f64) {
+        if self.latency_count == 0 {
+            return (0.0, 0.0);
+        }
+        (
+            self.latency_total_us as f64 / self.latency_count as f64 / 1000.0,
+            self.latency_max_us as f64 / 1000.0,
+        )
+    }
+
+    /// Oldest first; the console reverses it. The concrete iterator type is
+    /// returned rather than `impl Iterator` so callers keep `DoubleEndedIterator`.
+    pub fn recent_denials(&self) -> std::collections::vec_deque::Iter<'_, DeniedAttempt> {
+        self.recent_denials.iter()
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Holds the connection pool and the decision cache for the lifetime of the
 /// process. Build it **once**: a fresh `reqwest::Client` per connection would
 /// pay a TCP and TLS handshake inside a 300 ms budget that a human is waiting
@@ -469,6 +616,10 @@ pub struct Authorizer {
     /// that asks `authorize` gets break-glass handled for free, and none of them
     /// has to know the token format.
     breakglass: Breakglass,
+    /// T3.7. `Mutex` rather than atomics because the denial tail has to be
+    /// consistent with the counters it is a tail of — an operator reading
+    /// "3 denials" next to four rows would rightly stop trusting both.
+    stats: Mutex<DecisionStats>,
 }
 
 impl Authorizer {
@@ -497,7 +648,17 @@ impl Authorizer {
             client,
             cache: Mutex::new(HashMap::new()),
             breakglass: Breakglass::new(breakglass),
+            stats: Mutex::new(DecisionStats::default()),
         })
+    }
+
+    /// The T3.7 counters, for the runtime console.
+    pub fn stats(&self) -> std::sync::MutexGuard<'_, DecisionStats> {
+        match self.stats.lock() {
+            Ok(guard) => guard,
+            // Reporting is never worth taking a server down for.
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     pub fn breakglass_armed(&self) -> bool {
@@ -575,6 +736,54 @@ impl Authorizer {
     ///
     /// Never panics and never propagates: every failure is a decision.
     pub async fn authorize(&self, req: &AuthRequest<'_>) -> AuthDecision {
+        let decision = self.decide(req).await;
+        // T3.7, and recorded **here** rather than at the two chokepoints: this
+        // is the only line every decision passes through, so no call site can
+        // add a gate and forget to log it. That has already happened once in
+        // this file's history — `RequestRelay` was a whole chokepoint nobody
+        // knew existed until T3.3 went looking.
+        self.record(req, &decision);
+        decision
+    }
+
+    /// One structured line per decision, and the counters behind
+    /// `auth-decisions` in the runtime console.
+    ///
+    /// `key=value`, because hbbs logs plain text through `flexi_logger` and
+    /// this has to be greppable by a person and parseable by whatever ships the
+    /// logs. Allows are logged too, not only refusals: "who was brokered to
+    /// what, and how long did the decision take" is the other half of the
+    /// question, and `AUTH_TIMEOUT_MS` cannot be tuned (T5.8) from denials
+    /// alone.
+    fn record(&self, req: &AuthRequest<'_>, decision: &AuthDecision) {
+        // Interned so the console's denial tail can hold `&'static str`, and so
+        // an unknown gate is visible rather than silently mislabelled.
+        let gate = match req.gate {
+            GATE_PUNCH => GATE_PUNCH,
+            GATE_RELAY => GATE_RELAY,
+            _ => "other",
+        };
+        // Nothing here is attacker-controlled *text*: `to_id` and `conn_type`
+        // are bounded vocabularies or ids, and `reason` is ours or the api's —
+        // never the caller's. Quoted anyway, because a device id is a free
+        // string and one containing a space would otherwise split a field.
+        log::info!(
+            "authz gate={gate} outcome={} source={} to_id={:?} from_ip={:?} conn_type={:?} ms={:.1} ref={:?} reason={:?}",
+            if decision.allow { "allow" } else { "deny" },
+            decision.source.label(),
+            req.to_id,
+            req.from_ip,
+            req.conn_type,
+            decision.latency.as_secs_f64() * 1000.0,
+            decision.conn_audit_ref,
+            decision.reason,
+        );
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.record(gate, req, decision);
+        }
+    }
+
+    async fn decide(&self, req: &AuthRequest<'_>) -> AuthDecision {
         let started = Instant::now();
 
         if !self.config.required {
@@ -1094,6 +1303,7 @@ mod api_tests {
             to_id,
             conn_type,
             from_ip: "203.0.113.7",
+            gate: GATE_PUNCH,
         }
     }
 

@@ -936,16 +936,13 @@ impl RendezvousServer {
                     to_id: &id,
                     conn_type: auth::conn_type_name(ph.conn_type),
                     from_ip: &try_into_v4(addr).ip().to_string(),
+                    gate: auth::GATE_PUNCH,
                 })
                 .await;
+            // No denial log line here any more: `authorize` logs every decision
+            // itself (T3.7), allows included, so a line at each call site would
+            // be the same event twice with two different shapes.
             if !decision.allow {
-                log::info!(
-                    "Authorization denied for peer {} from {} [{}]: {}",
-                    id,
-                    addr,
-                    decision.source.label(),
-                    decision.reason
-                );
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
                     // Not a `Failure` variant — the enum has no code for "not
@@ -958,14 +955,6 @@ impl RendezvousServer {
                     ..Default::default()
                 });
                 return Ok((msg_out, None));
-            }
-            if decision.breakglass {
-                log::warn!(
-                    "Break-glass capability authorized {} -> {} [{}]",
-                    addr,
-                    id,
-                    decision.source.label()
-                );
             }
             // The ref is the only thing tying the session the controlled device is
             // about to open back to the user who asked for it: `/api/audit/conn`
@@ -1187,16 +1176,10 @@ impl RendezvousServer {
                     to_id: &rf.id,
                     conn_type: auth::conn_type_name(rf.conn_type),
                     from_ip: &try_into_v4(addr).ip().to_string(),
+                    gate: auth::GATE_RELAY,
                 })
                 .await;
             if !decision.allow {
-                log::info!(
-                    "Relay denied for peer {} from {} [{}]: {}",
-                    rf.id,
-                    addr,
-                    decision.source.label(),
-                    decision.reason
-                );
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_relay_response(RelayResponse {
                     refuse_reason: decision.reason,
@@ -1204,14 +1187,6 @@ impl RendezvousServer {
                 });
                 allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
                 return;
-            }
-            if decision.breakglass {
-                log::warn!(
-                    "Break-glass capability authorized relay {} -> {} [{}]",
-                    addr,
-                    rf.id,
-                    decision.source.label()
-                );
             }
             // **Overwritten, never merged.** Unlike the punch path — where hbbs
             // builds the outbound message itself — this one is A's message being
@@ -1343,12 +1318,13 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
                     "ip-changes(ic) [<id>|<number>] [-]",
                     "punch-requests(pr) [<number>] [-]",
+                    "auth-decisions(ad) [<number>] [<page size>] [-]",
                     "always-use-relay(aur)",
                     "test-geo(tg) <ip1> <ip2>"
                 )
@@ -1463,6 +1439,67 @@ impl RendezvousServer {
                         let event_iso = chrono::DateTime::<chrono::Utc>::from(event_system)
                             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                         let _ = writeln!(res, "{} {} -> {}@{}", event_iso, e.from_ip, e.to_id, e.to_ip);
+                    }
+                }
+            }
+            // T3.7. Sits next to `punch-requests` on purpose: `pr` answers
+            // "who was introduced to whom", and this answers the question that
+            // one cannot — **who was refused**. A refused attempt leaves no row
+            // anywhere else when the api was never asked, which is every
+            // no-token, every fail-closed, and every break-glass refusal.
+            Some("auth-decisions" | "ad") => {
+                use std::fmt::Write as _;
+                let arg = fds.next();
+                if let Some("-") = arg {
+                    self.authorizer.stats().clear();
+                    let _ = writeln!(res, "cleared");
+                } else {
+                    let stats = self.authorizer.stats();
+                    let (mean, max) = stats.latency_ms();
+                    let _ = writeln!(
+                        res,
+                        "allow={} deny={} latency_mean={mean:.1}ms latency_max={max:.1}ms",
+                        stats.allows(),
+                        stats.denials()
+                    );
+                    let by_source = stats
+                        .by_source()
+                        .iter()
+                        .map(|(label, n)| format!("{label}={n}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let _ = writeln!(res, "by-source: {}", if by_source.is_empty() { "-".to_owned() } else { by_source });
+                    let _ = writeln!(
+                        res,
+                        "cached={} brokerages={} break-glass: armed={} spent={} unreconciled={}",
+                        self.authorizer.cached_decisions(),
+                        self.broker.len(),
+                        self.authorizer.breakglass_armed(),
+                        self.authorizer.breakglass_spent(),
+                        self.authorizer.breakglass_pending(),
+                    );
+
+                    let start = arg.and_then(|x| x.parse::<usize>().ok()).unwrap_or(0);
+                    let mut page_size = fds.next().and_then(|x| x.parse::<usize>().ok()).unwrap_or(10);
+                    if page_size == 0 {
+                        page_size = 10;
+                    }
+                    // Newest first: a denial from four hours ago is rarely the
+                    // one being asked about.
+                    for d in stats.recent_denials().rev().skip(start).take(page_size) {
+                        let event = std::time::SystemTime::now() - d.at.elapsed();
+                        let at = chrono::DateTime::<chrono::Utc>::from(event)
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                        let _ = writeln!(
+                            res,
+                            "{at} {} {} -> {} [{}] {:?} {}",
+                            d.gate,
+                            d.from_ip,
+                            d.to_id,
+                            d.source.label(),
+                            d.conn_type,
+                            d.reason
+                        );
                     }
                 }
             }

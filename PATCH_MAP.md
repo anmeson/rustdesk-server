@@ -102,6 +102,9 @@ cannot identify a session, so `hbbs` is the sole enforcement point
 | S23 | applied 2026-09-15 (T3.6) | `src/breakglass.rs` (`AuditLog`, `AuditRecord`, `Reconciler`, three more config keys) | every use appended and **fsynced** before the decision returns; a use that cannot be written is refused; a slow background task replays unacknowledged records to `POST /api/internal/breakglass/reconcile`, tracked by a cursor file that carries a hash of the log's opening bytes | the reason an operator is on this path is that `apps/api` is down, so an audit that went there first would fail exactly when it mattered — "every use is logged" would be quietly untrue | Isolated | low — `chrono`, `reqwest` and `serde_json` were already dependencies |
 | S24 | applied 2026-09-15 (T3.6) | `src/rendezvous_server.rs` (`start_with_bind`), `src/auth.rs` (`breakglass_reconciler`), `src/main.rs` (`:38-40`) | the reconciler spawned as its own task, and three `--breakglass-audit-*` / `--breakglass-reconcile-sec` rows | it is not on any request path — the records are already durable, this only catches `apps/api` up | Structural (small) | ⚠ medium — same arg string as S2, S14, S21 |
 | S25 | applied 2026-09-15 (T3.6) | `tests/t35_breakglass.rs`, `tests/harness/mod.rs` (`dir()`, `switchable()`) | 2 more integration tests — the record is on disk during the outage and the cursor has not moved; the api recovers and the record is replayed exactly once — plus 9 unit tests over the log and cursor | the failure this guards against is silent by nature: a record that is never written, or a cursor that advances past one the api never got | Isolated | low |
+| S26 | applied 2026-09-15 (T3.7) | `src/auth.rs` (`DecisionStats`, `DeniedAttempt`, `AuthRequest.gate`, `record`, `authorize` split into `authorize` + `decide`) | one `key=value` log line per decision — allow *and* deny, with source, gate, latency and audit ref — plus counters and a bounded tail of recent refusals | **a refused connection leaves no row anywhere else** when the api was never asked, which is every no-token, fail-closed and break-glass refusal. Logged inside `authorize`, so a future chokepoint cannot be added and forget | Isolated | low — our own module |
+| S27 | applied 2026-09-15 (T3.7) | `src/rendezvous_server.rs` (`check_cmd`, both chokepoints) | `auth-decisions(ad)` in the runtime console beside `punch-requests(pr)`, and the two ad-hoc denial log lines deleted in favour of S26's | `pr` answers "who was introduced to whom"; this answers the one it cannot — who was refused, from where, and why | Structural (small) | ⚠ medium — `check_cmd`'s match arms and the help string are upstream's |
+| S28 | applied 2026-09-15 (T3.7) | `tests/t37_decision_log.rs` (new), `tests/harness/mod.rs` (`console`) | 5 tests: both outcomes logged with latency, the two gates named apart, a refusal the api never saw still recorded, and the console's summary / tail / paging / clear / help | the failure here is silence, which no other test would notice | Isolated | low |
 
 ### Notes on the `S` rows
 
@@ -176,6 +179,14 @@ so the reconciler goes *silently* idle with records it never sent. The log is
 append-only, so its opening bytes are fixed while it is the same file; a changed
 hash means a new one and the cursor resets. An inode would be the obvious
 answer, and `MetadataExt::ino` is not on the Windows build.
+
+**S27 puts who-was-refused on an unauthenticated port, and that is upstream's
+design.** The runtime console rides the NAT-test port (`handle_listener2`) and
+answers any **loopback** peer with no authentication at all. `auth-decisions`
+adds source addresses and device ids to what it will hand out, so a deployment
+that exposes that port — through a proxy, a container port mapping, an SSH
+tunnel left open — is handing out a list of who tried to reach what.
+`the_console_is_reachable_only_from_loopback` pins the branch.
 
 **`libs/hbb_common` is untouched** and should stay that way. Everything above
 uses the proto exactly as upstream ships it: no field was added, and no field

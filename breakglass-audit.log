@@ -7,3 +7,15 @@
 {"at":"2026-09-15T07:39:05.517Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-3","from_ip":"203.0.113.7","outcome":"used"}
 {"at":"2026-09-15T07:39:05.518Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-1","from_ip":"203.0.113.7","outcome":"used"}
 {"at":"2026-09-15T07:39:05.518Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-2","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:41:25.626Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-2","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:41:25.626Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-1","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:41:25.626Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-3","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:42:16.152Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-1","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:42:16.152Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-2","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:42:16.152Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-3","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:42:35.927Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-1","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:42:35.927Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-3","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:42:35.927Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-2","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:42:53.822Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-1","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:42:53.822Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-3","from_ip":"203.0.113.7","outcome":"used"}
+{"at":"2026-09-15T07:42:53.822Z","admin_id":"alice","to_id":"123456789","nonce":"nonce-2","from_ip":"203.0.113.7","outcome":"used"}

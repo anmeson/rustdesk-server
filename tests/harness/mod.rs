@@ -353,6 +353,23 @@ pub async fn hbbs_with_key(key: &str, extra: &[String]) -> Hbbs {
     s
 }
 
+/// Runs one runtime-console command and returns what hbbs printed.
+///
+/// The console rides on the **NAT-test port** (`port - 1`, `handle_listener2`)
+/// and answers only a **loopback** peer — it is a plaintext command channel with
+/// no authentication at all, and that is upstream's design, not ours. Write the
+/// command, read the reply, done: no framing, no protobuf.
+pub async fn console(port: u16, cmd: &str) -> String {
+    use hbb_common::tokio::net::TcpStream;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port - 1))
+        .await
+        .expect("the console port was not listening");
+    stream.write_all(cmd.as_bytes()).await.unwrap();
+    let mut buffer = vec![0u8; 16 * 1024];
+    let n = stream.read(&mut buffer).await.unwrap_or(0);
+    String::from_utf8_lossy(&buffer[..n]).into_owned()
+}
+
 /// Spawns `hbbs` expecting it **not** to start, and returns what it printed.
 ///
 /// Every config value that bounds a security check is validated before any port
