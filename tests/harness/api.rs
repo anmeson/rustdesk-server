@@ -127,28 +127,65 @@ impl Api {
 
 impl Drop for Api {
     /// **SIGTERM, not `Child::kill`.** `kill` sends SIGKILL, and the server's
-    /// SIGTERM handler is what drops its database — a killed one leaves it
-    /// behind for `scripts/e2e.sh clean` to find. Falls back to SIGKILL if it
+    /// SIGTERM handler is what drops its database. Falls back to SIGKILL if it
     /// does not go, because a leaked Node process holding a port is worse than a
     /// leaked database.
+    ///
+    /// A process that is **already dead** gets neither: `kill_now` is how T5.4
+    /// produces an outage, and a server killed that way never ran its handler.
+    /// So the database is dropped from here instead — without it every
+    /// break-glass test left one behind, and a suite that litters on every run
+    /// is a suite people stop running.
     fn drop(&mut self) {
-        let pid = self.child.id().to_string();
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                Err(_) => break,
+        let already_gone = matches!(self.child.try_wait(), Ok(Some(_)));
+        if !already_gone {
+            let pid = self.child.id().to_string();
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let mut exited = false;
+            while Instant::now() < deadline {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => {
+                        exited = true;
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(_) => break,
+                }
             }
+            if exited {
+                return;
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        drop_database(&self.db);
     }
+}
+
+/// Drops one test database directly, for the case where the server that owned
+/// it is not around to be asked.
+///
+/// Guarded on the `_test` suffix here as well as in `e2e-server.ts`: this one
+/// runs without the server's own refusal in front of it, and the cost of getting
+/// it wrong is somebody's fleet.
+fn drop_database(db: &str) {
+    if !db.ends_with("_test") {
+        return;
+    }
+    let script = format!(
+        r#"const {{MongoClient}}=require("mongodb");(async()=>{{const c=new MongoClient("mongodb://localhost:27017",{{serverSelectionTimeoutMS:3000}});await c.connect();await c.db({db:?}).dropDatabase();await c.close();}})().catch(()=>process.exit(1))"#
+    );
+    let _ = Command::new("node")
+        .current_dir(repo_root().join("apps/api"))
+        .args(["-e", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Where `apps/api` lives. Tests run with the crate root as their working
