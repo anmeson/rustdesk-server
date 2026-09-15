@@ -558,6 +558,41 @@ pub async fn register_peer_on(
     }
 }
 
+/// Asks hbbs which of `ids` are online, the way `OnlineRequest` does.
+///
+/// **On the NAT-test port (`port - 1`), and only from a non-loopback address**:
+/// `handle_listener2` answers a loopback peer with the runtime console instead
+/// (`rendezvous_server.rs:1713`), so a caller on 127.0.0.1 gets a command
+/// interpreter and no `OnlineResponse` at all. Pass `relay::relay_host()`.
+///
+/// Returns the packed bitmap, one bit per id, most significant bit first.
+/// Nothing about this route is authenticated — no licence key, no token — which
+/// is upstream's design and is exactly what T5.7 measures.
+pub async fn online_request(host: &str, port: u16, ids: &[String], ms: u64) -> Option<Vec<u8>> {
+    let mut stream = FramedStream::new(format!("{host}:{}", port - 1), None, 3_000)
+        .await
+        .ok()?;
+    let mut msg = RendezvousMessage::new();
+    msg.set_online_request(OnlineRequest {
+        peers: ids.to_vec(),
+        ..Default::default()
+    });
+    stream.send(&msg).await.ok()?;
+    let bytes = stream.next_timeout(ms).await?.ok()?;
+    match RendezvousMessage::parse_from_bytes(&bytes).ok()?.union {
+        Some(rendezvous_message::Union::OnlineResponse(r)) => Some(r.states.to_vec()),
+        _ => None,
+    }
+}
+
+/// Reads one bit out of an `OnlineResponse` bitmap, by the id's position in the
+/// request. Most significant bit first, as `handle_online_request` packs it.
+pub fn online_bit(states: &[u8], index: usize) -> bool {
+    states
+        .get(index / 8)
+        .is_some_and(|byte| byte & (0x01 << (7 - index % 8)) != 0)
+}
+
 /// A fresh UDP socket to speak `RegisterPk` from.
 pub async fn udp_socket() -> FramedSocket {
     FramedSocket::new("127.0.0.1:0".parse::<SocketAddr>().unwrap())

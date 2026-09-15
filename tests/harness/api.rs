@@ -455,6 +455,16 @@ impl Console {
         .await
     }
 
+    /// Disables (or re-enables) a user account.
+    ///
+    /// A disabled account is refused at `authorize()` **before** any grant is
+    /// consulted (`services/authorize.ts:67`), which makes it the one refusal a
+    /// user cannot fix by being granted something — T5.7's subject.
+    pub async fn set_user_disabled(&self, user_id: &str, disabled: bool) -> Value {
+        self.patch(&format!("/api/admin/users/{user_id}"), json!({ "disabled": disabled }))
+            .await
+    }
+
     pub async fn device(&self, device_id: &str) -> Value {
         self.get(&format!("/api/admin/devices/{device_id}")).await
     }
@@ -508,6 +518,34 @@ impl ClientApi {
             .as_str()
             .unwrap_or_else(|| panic!("no access_token in {body}"))
             .to_owned()
+    }
+
+    /// `POST /api/login` when it is expected to **fail**.
+    ///
+    /// Returns the token on success and the api's own `error` string otherwise.
+    /// T5.7 needs the failure: a disabled account is refused at the connect path
+    /// as "your session has expired", and the only thing that stops that being
+    /// misleading is what the client is told when it does sign in again.
+    pub async fn try_login(&self, email: &str, id: &str, uuid: &str) -> Result<String, String> {
+        let body: Value = self
+            .http
+            .post(format!("{}/api/login", self.base))
+            .json(&json!({
+                "username": email,
+                "password": USER_PASSWORD,
+                "id": id,
+                "uuid": uuid,
+            }))
+            .send()
+            .await
+            .expect("login request failed")
+            .json()
+            .await
+            .unwrap_or(Value::Null);
+        match body["access_token"].as_str() {
+            Some(token) => Ok(token.to_owned()),
+            None => Err(body["error"].as_str().unwrap_or("no error field").to_owned()),
+        }
     }
 
     /// `POST /api/devices/deploy` — `rustdesk --deploy --token <t>`. Enrols the

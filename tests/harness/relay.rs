@@ -83,7 +83,7 @@ impl Drop for Hbbr {
 /// started without `-k` relays for anybody who asks. That is a real deployment
 /// trap (docs/CONTEXT.md §7), and a test that reproduced it by accident would be
 /// testing a server nobody should run. T5.7 asks for it deliberately, through
-/// `hbbr_with_key("")`.
+/// `hbbr("")`, and measures what it does.
 pub async fn hbbr(key: &str) -> Hbbr {
     // hbbr binds `p` and `p + 2` (websocket). The four-port block hbbs uses
     // covers both, so the same allocator serves — and, more to the point, keeps
