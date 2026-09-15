@@ -27,6 +27,7 @@
 pub mod api;
 pub mod peer;
 pub mod relay;
+pub mod session;
 pub mod world;
 
 

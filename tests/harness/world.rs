@@ -30,10 +30,12 @@ use hbb_common::tokio::time::sleep;
 use super::{
     api::{api_with, Api, ClientApi, Console, SHARED_SECRET},
     hbbs_full,
-    peer::{next_device_id, Controller, Device},
+    peer::{next_device_id, Brokerage, Controller, Device},
     relay::{hbbr_on, Hbbr},
+    session::{next_conn_id, Session},
     Hbbs,
 };
+use serde_json::Value;
 use super::free_port_block;
 
 pub struct World {
@@ -253,6 +255,50 @@ impl World {
         let device = self.device(deployer).await;
         self.console.set_device_owner(&device.id, None).await;
         device
+    }
+
+    /// Turns a brokerage into a **live session**, as the controlled endpoint
+    /// does: the `action: "new"` audit post that joins the decision row to a
+    /// `conn_id`, then a first heartbeat so the device is on record as holding
+    /// it.
+    ///
+    /// Everything about revocation runs through here. A brokered connection
+    /// that never takes this step exists on the wire and nowhere else, so the
+    /// console cannot show it, `enforceLiveSessionAccess` cannot see it, and a
+    /// revoke reaches it only through the deliberate unattributed fallback.
+    pub async fn session(&self, device: &Device, brokerage: &Brokerage) -> Session {
+        let session = Session::open(
+            &self.client,
+            &device.id,
+            &device.uuid_b64(),
+            next_conn_id(),
+            brokerage,
+        )
+        .await;
+        let row = self.session_row(&device.id, session.conn_id).await;
+        // The join either happened or it did not, and a test should be able to
+        // say which: an unattributed session behaves differently under
+        // revocation on purpose (`disconnect.ts`).
+        let mut session = session;
+        session.attributed = row
+            .as_ref()
+            .and_then(|row| row["fromUserId"].as_str())
+            .is_some();
+        session
+    }
+
+    /// The session-log row for one live connection, if the console can see it.
+    ///
+    /// There is no `connId` filter on `/api/admin/sessions` — the console has
+    /// never needed one — so this filters the device's rows here rather than
+    /// adding a query parameter no product screen would use.
+    pub async fn session_row(&self, device_id: &str, conn_id: i64) -> Option<Value> {
+        let page = self.console.sessions(&format!("deviceId={device_id}&pageSize=200")).await;
+        page["sessions"]
+            .as_array()?
+            .iter()
+            .find(|row| row["connId"].as_i64() == Some(conn_id))
+            .cloned()
     }
 
     /// Waits for hbbs to have logged something, with the same polling the rest
