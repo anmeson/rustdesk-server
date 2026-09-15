@@ -17,7 +17,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -32,7 +32,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -52,8 +52,35 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    /// The second field is the *outbound* half of the `secure_tcp` handshake
+    /// (T3.4): `None` until the client accepts the key exchange, and from then
+    /// on every frame written to this sink is sealed with it.
+    ///
+    /// It rides inside `Sink` rather than beside the read loop because the sink
+    /// outlives that loop — it is parked in `tcp_punch` and taken out again by
+    /// whichever *other* connection ends up answering this one.
+    TcpStream(TcpStreamSink, Option<Encrypt>),
+    /// No encryptor. `secure_tcp_impl` returns `Ok(())` before the read on a
+    /// WebSocket (`apps/rustdesk/src/common.rs:2074-2076`) because wss already
+    /// encrypts the hop, so a ws client never answers a key exchange and could
+    /// not read a sealed frame if we sent one.
     Ws(WsSink),
+}
+
+/// The *inbound* half of the `secure_tcp` handshake, and the box secret key the
+/// offer was made with. One per TCP connection, owned by its read loop.
+///
+/// Two `Encrypt`s per connection rather than one shared: `Encrypt` keeps a send
+/// counter (`.1`) and a receive counter (`.2`) in one struct, and the two halves
+/// of a split stream live in different tasks. Each instance here touches only
+/// its own direction's counter, so the nonce sequence the client sees from its
+/// single `Encrypt` still matches.
+#[derive(Default)]
+struct Handshake {
+    /// Dropped once used: a second `KeyExchange` on the same connection must not
+    /// silently re-key a session that is already carrying traffic.
+    our_sk_b: Option<box_::SecretKey>,
+    dec: Option<Encrypt>,
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
@@ -517,6 +544,29 @@ impl RendezvousServer {
         Ok(())
     }
 
+    /// Builds the server's opening `KeyExchange` and the box secret key it is
+    /// made with (T3.4).
+    ///
+    /// `keys` carries exactly one element: our ephemeral X25519 public key,
+    /// signed with the server's ed25519 licence secret key. The client verifies
+    /// it against the licence key it was configured with, so this doubles as
+    /// proof to the client that it reached the right rendezvous server — and it
+    /// is why a key mismatch now fails in a millisecond with "Signature mismatch
+    /// in key exchange" instead of stalling for `READ_TIMEOUT`.
+    ///
+    /// Mirrors `secure_tcp_impl` (`apps/rustdesk/src/common.rs:2069-2113`) and is
+    /// the same shape upstream's *client* already implements as a server, in
+    /// `accept_connection` (`apps/rustdesk/src/server.rs:208-238`).
+    fn key_exchange_offer(sk: &sign::SecretKey) -> (RendezvousMessage, box_::SecretKey) {
+        let (our_pk_b, our_sk_b) = box_::gen_keypair();
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_key_exchange(KeyExchange {
+            keys: vec![sign::sign(&our_pk_b.0, sk).into()],
+            ..Default::default()
+        });
+        (msg_out, our_sk_b)
+    }
+
     #[inline]
     async fn handle_tcp(
         &mut self,
@@ -525,9 +575,61 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        hs: &mut Handshake,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
+                // The client accepting our opening offer (T3.4). `keys` is
+                // `[asymmetric_value, symmetric_value]`: its ephemeral box public
+                // key, and the symmetric key sealed to ours. From the next frame
+                // on, both directions are encrypted — which is what keeps the
+                // login token out of cleartext on the wire.
+                //
+                // Nothing here is mandatory. A client that never sends this goes
+                // on speaking plaintext and is served exactly as upstream serves
+                // it; that is not laxity, it is required, because the controlled
+                // device opens short write-only TCP connections for
+                // `RelayResponse`, `LocalAddr` and `PunchHoleSent`
+                // (`apps/rustdesk/src/rendezvous_mediator.rs:627`, `:717`, `:995`)
+                // that never read our offer and never call `secure_tcp`.
+                Some(rendezvous_message::Union::KeyExchange(ex)) => {
+                    // `take` rather than `as_ref`: one offer, one acceptance. A
+                    // second `KeyExchange` would otherwise re-key a live
+                    // connection mid-stream and desynchronise both counters.
+                    let Some(our_sk_b) = hs.our_sk_b.take() else {
+                        log::debug!("Unexpected KeyExchange from {:?}", addr);
+                        return false;
+                    };
+                    if ex.keys.len() != 2 {
+                        log::debug!(
+                            "Bad KeyExchange from {:?}: {} keys, want 2",
+                            addr,
+                            ex.keys.len()
+                        );
+                        return false;
+                    }
+                    match Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk_b) {
+                        Ok(sym) => {
+                            // Both directions, and only now: the acceptance
+                            // itself arrived in plaintext, as did our offer, so
+                            // neither counted against a counter.
+                            if let Some(Sink::TcpStream(_, enc)) = sink.as_mut() {
+                                *enc = Some(Encrypt::new(sym.clone()));
+                            }
+                            hs.dec = Some(Encrypt::new(sym));
+                            log::debug!("Connection secured with {:?}", addr);
+                            // `handle_tcp`'s tail is `false`, which closes the
+                            // connection — right for upstream's one-shot
+                            // messages, fatal here: the handshake exists so that
+                            // the *next* frame can be read.
+                            return true;
+                        }
+                        Err(err) => {
+                            log::debug!("KeyExchange from {:?} failed: {}", addr, err);
+                            return false;
+                        }
+                    }
+                }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
@@ -954,7 +1056,15 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, enc) => {
+                        // Sealed only once the handshake keyed this sink (T3.4).
+                        // Before that — and for every connection that never
+                        // answers the offer, which is most of them — this is
+                        // upstream's plaintext write, byte for byte.
+                        let bytes = match enc.as_mut() {
+                            Some(enc) => enc.enc(&bytes),
+                            None => bytes,
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1403,18 +1513,43 @@ impl RendezvousServer {
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
+            // No offer on ws: see `Sink::Ws`.
+            let mut hs = Handshake::default();
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &mut hs).await {
                         break;
                     }
                 }
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+            sink = Some(Sink::TcpStream(a, None));
+            let mut hs = Handshake::default();
+            // The server speaks first, unprompted — `secure_tcp` blocks on
+            // `conn.next()` before it sends anything, so there is nothing to
+            // answer (T3.4). Offered to every TCP connection, not only the ones
+            // that want it: at this point not a byte has been read, so there is
+            // no way to tell which is which.
+            //
+            // Safe to offer blindly because upstream's client already tolerates
+            // an unsolicited one — every read of this connection goes through
+            // `get_next_nonkeyexchange_msg`, which skips it
+            // (`apps/rustdesk/src/common.rs:1972-1993`) — and because a client
+            // that ignores it stays on the plaintext path above.
+            if let Some(sk) = self.inner.sk.as_ref() {
+                let (msg_out, our_sk_b) = Self::key_exchange_offer(sk);
+                hs.our_sk_b = Some(our_sk_b);
+                Self::send_to_sink(&mut sink, msg_out).await;
+            }
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(dec) = hs.dec.as_mut() {
+                    if let Err(err) = dec.dec(&mut bytes) {
+                        log::debug!("Decryption failed from {:?}: {}", addr, err);
+                        break;
+                    }
+                }
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws, &mut hs).await {
                     break;
                 }
             }

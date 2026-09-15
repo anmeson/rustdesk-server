@@ -86,8 +86,31 @@ cannot identify a session, so `hbbs` is the sole enforcement point
 | S7 | applied 2026-09-15 (T3.3) | `tests/t33_chokepoint.rs` (new) | integration harness: spawns the real `hbbs`, speaks `RegisterPk` / `PunchHoleRequest` / `RequestRelay` at it, asserts on what A and B receive | a 🔴 gate with no automated proof is a gate nobody can merge upstream into with confidence | Isolated | low |
 | S8 | applied 2026-09-15 (T3.3b) | `src/rendezvous_server.rs` (`:539-545` and new `handle_request_relay`, `:980-1071`) | the `RequestRelay` arm moved into a method that authorizes before forwarding; a denial answers A with `RelayResponse{refuse_reason}`; `controlled_context` and `control_permissions` are **overwritten** from the decision | **the second security boundary.** Without it the punch-hole gate is decorative — a stranger simply does not send a `PunchHoleRequest`. The overwrite matters on its own: these two fields arrive from A here, and a forged ref would let one session claim another user's decision row | Structural | ⚠ **high** — same file and same churn as S5 |
 | S9 | applied 2026-09-15 (T3.3b) | `src/rendezvous_server.rs` (`:556-566`) | `rr.refuse_reason` cleared on a **forwarded** `RelayResponse` | that field is routed on a sender-supplied address and is the only attacker-reachable field that becomes text on a waiting user's screen. Nothing legitimate writes it — the client only reads it and OSS hbbs never set it — so forwarding it can only carry a stranger's words | Isolated | ⚠ medium — becomes wrong if upstream ever starts writing this field itself |
+| S10 | applied 2026-09-15 (T3.4) | `src/rendezvous_server.rs` (`:52-88` `Sink`/`Handshake`, `key_exchange_offer`, the `KeyExchange` arm in `handle_tcp`, the offer + decrypt in `handle_listener_inner`, `send_to_sink`) | the server half of `secure_tcp`: `hbbs` now sends a signed `KeyExchange` unprompted on every TCP connection, and keys both directions if the client answers | **without it, login is unusable.** `secure_tcp` blocks waiting for a server that never spoke, so a client with a licence key *and* a token stalled `READ_TIMEOUT` (18 s, measured) and failed **every** outbound connection (T0.6). It also takes the login token out of cleartext | Structural | ⚠ **high** — `handle_tcp`'s signature, `handle_listener_inner`'s read loop and the `Sink` enum are all upstream's |
+| S11 | applied 2026-09-15 (T3.4) | `tests/harness/` (new), `tests/t33_chokepoint.rs` | the S7 harness extracted into a shared module so T3.4's suite could spawn a real `hbbs` without copying it; `next_plaintext` added, mirroring the client's `get_next_nonkeyexchange_msg` | S7's tests are hand-rolled clients with none of the real client's tolerance for the new offer, so every one of them broke on it | Isolated | low |
+| S12 | applied 2026-09-15 (T3.4) | `tests/t34_key_exchange.rs` (new) | 9 tests: the offer and its signature, the token's absence from the actual bytes written, both directions encrypted, plaintext clients still served, and a plaintext peer answering an encrypted controller | a 🔴 change to the connect path of every connection | Isolated | low |
 
 ### Notes on the `S` rows
+
+**S10 is where to look if clients hang after a merge.** Three things have to
+stay together or the handshake half-works: the offer must be sent *before* the
+read loop (the client speaks second, so nobody speaks at all if this moves);
+the `KeyExchange` arm must `return true`, because `handle_tcp`'s tail is
+`false` and closing the connection is right for upstream's one-shot messages
+and fatal for a handshake; and the encryptor must stay *inside* `Sink`, because
+the sink is parked in `tcp_punch` and sealed by whichever other connection
+answers — `a_plaintext_peer_can_answer_an_encrypted_controller` (S12) is the
+test that catches that last one.
+
+**S10 is not behind a flag, and is safe unflagged in one direction only.** The
+offer goes to every TCP connection, because at that point `hbbs` has not read a
+byte and cannot tell who wants one. That is survivable because upstream's client
+already skips an unsolicited `KeyExchange` on every read of this connection
+(`get_next_nonkeyexchange_msg`, `apps/rustdesk/src/common.rs:1972-1993`), and
+because a client that never answers keeps being served in plaintext — which is
+required, not merely tolerated: the controlled device answers punches over short
+write-only TCP connections that never call `secure_tcp`
+(`apps/rustdesk/src/rendezvous_mediator.rs:627`, `:717`, `:995`).
 
 **S5 is the row to check on every merge, and ordering is the whole risk.** The
 patch must stay *after* the cheap checks (nothing that was going to be refused
