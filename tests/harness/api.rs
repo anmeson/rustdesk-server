@@ -221,7 +221,7 @@ pub async fn api_with(extra_env: &[(&str, String)]) -> Api {
     // Per world, and dropped at both ends of its life (see e2e-server.ts). The
     // `_test` suffix is not decoration: the server refuses to start without it,
     // because it drops whatever it is pointed at.
-    let db = format!("anmesondesk_e2e_{}_{}_test", std::process::id(), port);
+    let db = format!("tracemote_e2e_{}_{}_test", std::process::id(), port);
     spawn_api(port, db, TempDir::new(), extra_env, false).await
 }
 
